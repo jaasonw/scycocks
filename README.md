@@ -1,7 +1,5 @@
 # Scycocks
 
-[![Built with Slint](https://raw.githubusercontent.com/slint-ui/slint/master/logo/MadeWithSlint-logo-whitebg.png)](https://slint.dev)
-
 Offline Windows configurator for the Scyrox V8, written in Rust with a Slint interface. It talks to the mouse through the HID driver Windows already provides. No browser, account, background service, or vendor application is required.
 
 ## Run
@@ -93,6 +91,8 @@ Protocol sources, artifact hashes, firmware findings, and investigation limits a
 
 This project's source code is MIT licensed; see [LICENSE](LICENSE).
 
-The app uses Slint under the [Slint Royalty-free Desktop, Mobile, and Web Applications License 2.0](https://github.com/slint-ui/slint/blob/master/LICENSES/LicenseRef-Slint-Royalty-free-2.0.md), which requires attribution. That requirement is met by the badge at the top of this page, per section 2(b) of the license. The MIT license covers this project's own code. Distributed binaries also carry Slint's license terms. Other dependencies keep their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The app uses Slint under the [Slint Royalty-free Desktop, Mobile, and Web Applications License 2.0](https://github.com/slint-ui/slint/blob/master/LICENSES/LicenseRef-Slint-Royalty-free-2.0.md), which requires attribution. That requirement is met by the badge below, per section 2(b) of the license. The MIT license covers this project's own code. Distributed binaries also carry Slint's license terms. Other dependencies keep their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 The MIT license does not grant rights to vendor firmware or artwork.
+
+[<img src="https://raw.githubusercontent.com/slint-ui/slint/master/logo/MadeWithSlint-logo-whitebg.png" width="120" alt="Built with Slint">](https://slint.dev)
