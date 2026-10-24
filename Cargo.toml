@@ -1,0 +1,21 @@
+[package]
+name = "scycocks"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Offline Scyrox mouse configurator"
+
+[features]
+default = ["gui"]
+gui = ["dep:slint"]
+
+[dependencies]
+hidapi = "2.6.7"
+slint = { version = "1.16", optional = true, default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2", "accessibility"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[lints.clippy]
+all = "warn"
