@@ -2,292 +2,331 @@ use crate::{
     device::{self, Mouse},
     settings::{self, Settings},
 };
-use slint::{ComponentHandle, Model, ModelRc, VecModel};
-use std::{cell::RefCell, rc::Rc, sync::mpsc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::mpsc,
+    time::{Duration, Instant},
+};
+use wxdragon::prelude::*;
 
-slint::slint! {
-    import { CheckBox, ComboBox, Slider, SpinBox, ScrollView, LineEdit } from "std-widgets.slint";
+const RATES: [u16; 7] = [125, 250, 500, 1000, 2000, 4000, 8000];
+const SLEEP_TIMES: [u8; 8] = [1, 3, 6, 12, 18, 30, 60, 180];
+const BUTTON_NAMES: [&str; 6] = [
+    "Left button",
+    "Right button",
+    "Middle button",
+    "Back button",
+    "Forward button",
+    "DPI button",
+];
+const WRAP_WIDTH: i32 = 560;
 
-    component UtilityButton inherits Rectangle {
-        in property <string> text;
-        in property <bool> enabled: true;
-        in property <bool> active: false;
-        callback clicked();
-        min-width: 80px;
-        min-height: 24px;
-        background: touch.pressed || root.active ? #fafafa : #efefef;
-        border-width: 1px;
-        border-color: #8a8a8a;
-        forward-focus: focus;
-        accessible-role: button;
-        accessible-label: root.text;
-        accessible-enabled: root.enabled;
-        accessible-action-default => { if root.enabled { root.clicked(); } }
-        Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: 1px; background: #ffffff; }
-        Rectangle { x: 1px; y: 1px; width: 1px; height: parent.height - 2px; background: #ffffff; }
-        Text {
-            text: root.text;
-            color: root.enabled ? #111111 : #888888;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-        }
-        if focus.has-focus : Rectangle {
-            x: 3px; y: 3px; width: parent.width - 6px; height: parent.height - 6px;
-            border-width: 1px; border-color: #777777;
-        }
-        touch := TouchArea {
-            enabled: root.enabled;
-            clicked => { focus.focus(); root.clicked(); }
-        }
-        focus := FocusScope {
-            width: 0px;
-            enabled: root.enabled;
-            key-pressed(event) => {
-                if event.text == Key.Return || event.text == Key.Space {
-                    root.clicked();
-                    return accept;
-                }
-                return reject;
-            }
-        }
+#[derive(Clone, Copy)]
+struct Ui {
+    root: Panel,
+    basic: Panel,
+    mapping: Panel,
+    info: StaticText,
+    connect: Button,
+    status: StaticText,
+    apply: Button,
+    profile: Choice,
+    load_profile: Button,
+    rate: Choice,
+    max_rate: StaticText,
+    lod: Choice,
+    active_stage: SpinCtrl,
+    stages: SpinCtrl,
+    dpi: [(StaticText, Slider, SpinCtrlDouble); 8],
+    motion_sync: CheckBox,
+    angle_snap: CheckBox,
+    ripple: CheckBox,
+    competitive: CheckBox,
+    scanning: CheckBox,
+    sleep: Choice,
+    angle_enabled: CheckBox,
+    angle: SpinCtrl,
+    debounce_slider: Slider,
+    debounce: SpinCtrl,
+    pair: Button,
+    reset: Button,
+    buttons: [(Choice, TextCtrl); 6],
+}
+
+#[derive(Default)]
+struct State {
+    connected: Cell<bool>,
+    busy: Cell<bool>,
+    profiles_supported: Cell<bool>,
+    reset_armed: Cell<bool>,
+    max_rate: Cell<u16>,
+    details: RefCell<String>,
+    connection_status: RefCell<String>,
+    current: RefCell<Option<Settings>>,
+}
+
+fn text(parent: &impl WxWidget, label: &str) -> StaticText {
+    StaticText::builder(parent).with_label(label).build()
+}
+
+// Built with the widest label it will show so relabeling never shrinks it.
+fn button(parent: &impl WxWidget, label: &str) -> Button {
+    let button = Button::builder(parent).with_label(label).build();
+    button.set_min_size(button.get_best_size());
+    button
+}
+
+fn choice(parent: &impl WxWidget, items: &[&str]) -> Choice {
+    Choice::builder(parent)
+        .with_choices(items.iter().map(|item| (*item).to_string()).collect())
+        .build()
+}
+
+fn row(page: &BoxSizer, parent: &Panel, caption: &str) -> (BoxSizer, StaticText) {
+    let row = BoxSizer::builder(Orientation::Horizontal).build();
+    let caption = text(parent, caption);
+    caption.set_min_size(Size::new(110, -1));
+    row.add(&caption, 0, SizerFlag::AlignCenterVertical, 0);
+    page.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 6);
+    (row, caption)
+}
+
+fn put<W: WxWidget>(row: &BoxSizer, widget: &W) {
+    row.add(
+        widget,
+        0,
+        SizerFlag::AlignCenterVertical | SizerFlag::Left,
+        8,
+    );
+}
+
+fn note(page: &BoxSizer, parent: &Panel, label: &str) {
+    let note = text(parent, label);
+    note.wrap(WRAP_WIDTH);
+    page.add(&note, 0, SizerFlag::All, 6);
+}
+
+fn set_status(ui: &Ui, message: &str) {
+    ui.status.set_label(message);
+    ui.status.wrap(WRAP_WIDTH);
+}
+
+fn sync(ui: &Ui, state: &State) {
+    let connected = state.connected.get();
+    let busy = state.busy.get();
+    let edit = connected && !busy;
+    let info = if connected {
+        state.details.borrow().clone()
+    } else if busy {
+        "Reading mouse settings…".into()
+    } else {
+        state.connection_status.borrow().clone()
+    };
+    ui.info.set_label(&info);
+    ui.info.wrap(WRAP_WIDTH);
+    ui.connect.set_label(if connected {
+        "Reconnect"
+    } else {
+        "Connect mouse"
+    });
+    ui.connect.enable(!busy);
+    ui.apply.set_label(if busy { "Working…" } else { "APPLY" });
+    ui.apply.enable(edit);
+    let profiles = edit && state.profiles_supported.get();
+    ui.profile.enable(profiles);
+    ui.load_profile.enable(profiles);
+    ui.max_rate.set_label(&match state.max_rate.get() {
+        0 => String::new(),
+        rate => format!("Maximum: {rate} Hz"),
+    });
+    for choice in [ui.rate, ui.lod, ui.sleep] {
+        choice.enable(edit);
     }
-
-    export component Configurator inherits Window {
-        title: "Scycocks · Scyrox V8 Configuration Tool";
-        preferred-width: 660px;
-        preferred-height: 720px;
-        min-width: 600px;
-        min-height: 520px;
-        background: #efefef;
-        default-font-family: "Segoe UI";
-        default-font-size: 12px;
-        in-out property <int> page: 0;
-        in property <string> software-version;
-        out property <length> connection-button-x: info.x + connection-action.x;
-        out property <length> connection-button-y: info.y + connection-action.y;
-        in property <bool> connected: false;
-        in-out property <bool> busy: false;
-        in property <string> device-name: "No mouse connected";
-        in property <string> details;
-        in property <string> connection-status: "Connect a Scyrox V8 or its receiver.";
-        out property <string> info-text: root.connected ? root.details : root.busy ? "Reading mouse settings…" : root.connection-status;
-        in-out property <string> status: "Settings remain unchanged until you select Apply.";
-        in property <[int]> dpi-values;
-        in property <[int]> button-values;
-        in-out property <int> stage-count: 1;
-        in-out property <bool> competitive: false;
-        in-out property <bool> scanning-20k: false;
-        in-out property <int> sleep-index: 5;
-        in-out property <int> angle: 0;
-        in-out property <bool> angle-enabled: false;
-        in property <bool> profiles-supported: false;
-        in-out property <int> profile-index: 0;
-        in-out property <bool> reset-armed: false;
-        in property <[string]> shortcut-values;
-        in property <int> max-rate: 1000;
-        in-out property <int> rate-index: 3;
-        in-out property <int> active-stage: 1;
-        in-out property <int> debounce: 0;
-        in-out property <int> lod: 1;
-        in-out property <bool> motion-sync: false;
-        in-out property <bool> angle-snap: false;
-        in-out property <bool> ripple: false;
-        callback connect-mouse();
-        callback apply();
-        callback dpi-edited(int, int);
-        callback button-edited(int, int);
-        callback shortcut-edited(int, string);
-        callback stages-edited(int);
-        callback switch-profile();
-        callback pair-receiver();
-        callback factory-reset();
-
-        VerticalLayout {
-            padding: 18px;
-            spacing: 18px;
-            info := Rectangle {
-                height: 104px;
-                border-width: 1px;
-                border-color: #a0a0a0;
-                background: #efefef;
-                Rectangle {
-                    x: 6px; y: -7px; width: 30px; height: 16px; background: #efefef;
-                    Text { text: "Info"; color: #111111; horizontal-alignment: center; }
-                }
-                Text { x: 12px; y: 22px; width: parent.width - 24px; text: root.info-text; color: #111111; wrap: word-wrap; }
-                Text { x: 12px; y: 58px; text: "Software version: " + root.software-version; color: #111111; }
-                connection-action := UtilityButton {
-                    x: parent.width - self.width - 12px;
-                    y: parent.height - self.height - 12px;
-                    width: 104px; height: 24px;
-                    text: root.connected ? "Reconnect" : "Connect mouse";
-                    enabled: !root.busy;
-                    clicked => { root.connect-mouse(); }
-                }
-            }
-            Rectangle {
-                vertical-stretch: 1;
-                border-width: 1px;
-                border-color: #999999;
-                background: #efefef;
-                VerticalLayout {
-                    padding: 2px;
-                    spacing: 0px;
-                    HorizontalLayout {
-                        height: 26px;
-                        spacing: 2px;
-                        alignment: start;
-                        for title[index] in ["Basic", "Advanced Sensor", "Buttons", "Button Mapping"] : UtilityButton {
-                            width: index == 0 ? 58px : index == 2 ? 70px : 116px;
-                            height: 24px;
-                            text: title;
-                            active: root.page == index;
-                            clicked => { root.reset-armed = false; root.page = index; }
-                        }
-                    }
-                    if root.page == 0 : ScrollView {
-                        VerticalLayout {
-                            padding: 26px;
-                            spacing: 20px;
-                            alignment: start;
-                            HorizontalLayout {
-                                spacing: 12px;
-                                alignment: start;
-                                Text { text: "Profile"; width: 100px; vertical-alignment: center; color: #111111; }
-                                ComboBox { width: 116px; model: ["Profile 1", "Profile 2", "Profile 3", "Profile 4"]; current-index <=> root.profile-index; enabled: root.connected && !root.busy && root.profiles-supported; }
-                                UtilityButton { width: 110px; text: "Load profile"; enabled: root.connected && !root.busy && root.profiles-supported; clicked => { root.switch-profile(); } }
-                            }
-                            HorizontalLayout {
-                                spacing: 12px;
-                                alignment: start;
-                                Text { text: "Polling rate"; width: 100px; vertical-alignment: center; color: #111111; }
-                                ComboBox {
-                                    width: 116px;
-                                    enabled: root.connected && !root.busy;
-                                    model: ["125 Hz", "250 Hz", "500 Hz", "1000 Hz", "2000 Hz", "4000 Hz", "8000 Hz"];
-                                    current-index <=> root.rate-index;
-                                }
-                                Text { text: "Maximum: " + root.max-rate + " Hz"; vertical-alignment: center; color: #555555; }
-                            }
-                            HorizontalLayout {
-                                spacing: 12px;
-                                alignment: start;
-                                Text { text: "Lift-off distance"; width: 100px; vertical-alignment: center; color: #111111; }
-                                ComboBox {
-                                    width: 116px;
-                                    enabled: root.connected && !root.busy;
-                                    model: ["0.7 mm", "1 mm", "2 mm"];
-                                    current-index: root.lod == 3 ? 0 : root.lod;
-                                    selected(value) => { root.lod = self.current-index == 0 ? 3 : self.current-index; }
-                                }
-                            }
-                            HorizontalLayout {
-                                spacing: 12px;
-                                alignment: start;
-                                Text { text: "Active DPI stage"; width: 100px; vertical-alignment: center; color: #111111; }
-                                SpinBox { width: 116px; enabled: root.connected && !root.busy; minimum: 1; maximum: max(1, root.stage-count); value <=> root.active-stage; }
-                                Text { text: "Stages"; vertical-alignment: center; color: #555555; }
-                                SpinBox { width: 80px; minimum: 1; maximum: 8; value: root.stage-count; enabled: root.connected && !root.busy; edited(value) => { root.stage-count = value; root.active-stage = min(root.active-stage, value); root.stages-edited(value); } }
-                            }
-                            for dpi[index] in root.dpi-values : HorizontalLayout {
-                                spacing: 12px;
-                                Text { text: "DPI " + (index + 1); width: 54px; color: #111111; vertical-alignment: center; }
-                                Slider {
-                                    horizontal-stretch: 1;
-                                    enabled: root.connected && !root.busy;
-                                    minimum: 50; maximum: 30000; step: 50; value: dpi;
-                                    changed(value) => { root.dpi-edited(index, round(value)); }
-                                }
-                                SpinBox { width: 100px; enabled: root.connected && !root.busy; minimum: 50; maximum: 30000; step-size: 50; value: dpi; edited(value) => { root.dpi-edited(index, value); } }
-                            }
-                        }
-                    }
-                    if root.page == 1 : ScrollView {
-                        VerticalLayout {
-                            padding: 28px;
-                            spacing: 18px;
-                            alignment: start;
-                            CheckBox { text: "Motion Sync"; enabled: root.connected && !root.busy; checked <=> root.motion-sync; }
-                            CheckBox { text: "Angle snapping"; enabled: root.connected && !root.busy; checked <=> root.angle-snap; }
-                            CheckBox { text: "Ripple control"; enabled: root.connected && !root.busy; checked <=> root.ripple; }
-                            CheckBox { text: "Competitive Mode"; enabled: root.connected && !root.busy; checked <=> root.competitive; toggled => { if !self.checked { root.scanning-20k = false; } } }
-                            CheckBox { text: "20K sensor scanning"; enabled: root.connected && !root.busy && root.competitive; checked <=> root.scanning-20k; }
-                            Text { text: "Competitive Mode and 20K scanning use more battery."; color: #555555; wrap: word-wrap; }
-                            HorizontalLayout {
-                                spacing: 16px;
-                                Text { text: "Sleep time"; width: 110px; vertical-alignment: center; color: #111111; }
-                                ComboBox { width: 150px; enabled: root.connected && !root.busy; model: ["10 seconds", "30 seconds", "1 minute", "2 minutes", "3 minutes", "5 minutes", "10 minutes", "30 minutes"]; current-index <=> root.sleep-index; }
-                            }
-                            HorizontalLayout {
-                                spacing: 16px;
-                                CheckBox { text: "Angle tuning"; enabled: root.connected && !root.busy; checked <=> root.angle-enabled; }
-                                SpinBox { width: 100px; minimum: -30; maximum: 30; value <=> root.angle; enabled: root.connected && !root.busy && root.angle-enabled; }
-                                Text { text: "degrees"; vertical-alignment: center; color: #555555; }
-                            }
-                        }
-                    }
-                    if root.page == 2 : ScrollView {
-                        VerticalLayout {
-                            padding: 28px;
-                            spacing: 18px;
-                            alignment: start;
-                            HorizontalLayout {
-                                spacing: 18px;
-                                Text { text: "Debounce (ms)"; width: 110px; vertical-alignment: center; color: #111111; }
-                                Slider { minimum: 0; maximum: 30; step: 1; value: root.debounce; enabled: root.connected && !root.busy; changed(value) => { root.debounce = round(value); } }
-                                SpinBox { width: 80px; minimum: 0; maximum: 30; value <=> root.debounce; enabled: root.connected && !root.busy; }
-                            }
-                            Text { text: "Applies to all buttons."; color: #555555; }
-                            Text { text: "Pairing: hold left, right and middle buttons for 3 seconds until the light flashes. Keep the mouse close to the receiver."; color: #555555; wrap: word-wrap; }
-                            HorizontalLayout {
-                                alignment: start;
-                                spacing: 14px;
-                                UtilityButton { text: "Pair receiver"; width: 120px; enabled: !root.busy; clicked => { root.pair-receiver(); } }
-                                UtilityButton { text: root.reset-armed ? "Click again to reset" : "Factory reset"; width: 150px; enabled: root.connected && !root.busy; clicked => { if root.reset-armed { root.reset-armed = false; root.factory-reset(); } else { root.reset-armed = true; root.status = "Factory reset clears stored settings. Click again to reset."; } } }
-                            }
-                            Text { text: "Loading a profile or resetting discards pending edits."; color: #555555; wrap: word-wrap; }
-                        }
-                    }
-                    if root.page == 3 : ScrollView {
-                        VerticalLayout {
-                            padding: 28px;
-                            spacing: 14px;
-                            alignment: start;
-                            for action[index] in root.button-values : VerticalLayout {
-                                spacing: 6px;
-                                HorizontalLayout {
-                                    spacing: 18px;
-                                    alignment: start;
-                                    Text { text: ["Left button", "Right button", "Middle button", "Back button", "Forward button", "DPI button"][index]; width: 110px; vertical-alignment: center; color: #111111; }
-                                    ComboBox {
-                                        width: 240px;
-                                        enabled: root.connected && !root.busy;
-                                        model: ["Left click", "Right click", "Middle click", "Back", "Forward", "Cycle DPI", "Cycle polling rate", "Disabled", "Keep existing action", "Keyboard shortcut", "Media key"];
-                                        current-index: action;
-                                        selected(value) => { root.button-edited(index, self.current-index); }
-                                    }
-                                }
-                                if action == 9 || action == 10 : LineEdit {
-                                    enabled: root.connected && !root.busy;
-                                    placeholder-text: action == 9 ? "Ctrl+Shift+A" : "VolumeUp / PlayPause / NextTrack";
-                                    text: root.shortcut-values[index];
-                                    edited(value) => { root.shortcut-edited(index, value); }
-                                }
-                            }
-                            Text { text: "Keyboard: Ctrl/Shift/Alt/Win + one key. Media: VolumeUp, VolumeDown, Mute, PlayPause, Stop, NextTrack, PreviousTrack, BrowserBack, BrowserForward, BrowserHome, BrowserRefresh, Calculator."; color: #555555; wrap: word-wrap; }
-                        }
-                    }
-                }
-            }
-            Text { text: root.status; color: #555555; wrap: word-wrap; }
-            HorizontalLayout {
-                alignment: end;
-                spacing: 10px;
-                height: 24px;
-                UtilityButton { width: 90px; text: root.busy ? "Working…" : "APPLY"; enabled: root.connected && !root.busy; clicked => { root.apply(); } }
-            }
-        }
+    for check in [
+        ui.motion_sync,
+        ui.angle_snap,
+        ui.ripple,
+        ui.competitive,
+        ui.angle_enabled,
+    ] {
+        check.enable(edit);
     }
+    ui.scanning.enable(edit && ui.competitive.is_checked());
+    ui.angle.enable(edit && ui.angle_enabled.is_checked());
+    for spin in [ui.active_stage, ui.stages, ui.debounce] {
+        spin.enable(edit);
+    }
+    ui.debounce_slider.enable(edit);
+    let stages = usize::try_from(ui.stages.value()).unwrap_or(1);
+    for (index, (caption, slider, spin)) in ui.dpi.iter().enumerate() {
+        let shown = index < stages;
+        caption.show(shown);
+        slider.show(shown);
+        spin.show(shown);
+        slider.enable(edit);
+        spin.enable(edit);
+    }
+    ui.pair.enable(!busy);
+    ui.reset.enable(edit);
+    ui.reset.set_label(if state.reset_armed.get() {
+        "Click again to reset"
+    } else {
+        "Factory reset"
+    });
+    for (action, shortcut) in ui.buttons {
+        action.enable(edit);
+        shortcut.enable(edit);
+        shortcut.show(matches!(action.get_selection(), Some(9 | 10)));
+    }
+    ui.basic.layout();
+    ui.mapping.layout();
+    ui.root.layout();
+}
+
+fn send(ui: &Ui, state: &State, commands: &mpsc::Sender<Command>, command: Command, message: &str) {
+    state.busy.set(true);
+    set_status(ui, message);
+    if commands.send(command).is_err() {
+        state.busy.set(false);
+        state.connected.set(false);
+        set_status(ui, "The HID worker stopped. Restart the app.");
+    }
+    sync(ui, state);
+}
+
+fn set_dpi(row: &(StaticText, Slider, SpinCtrlDouble), dpi: u16) {
+    row.1.set_value(i32::from(dpi / 50));
+    row.2.set_value(f64::from(dpi));
+}
+
+fn desired(ui: &Ui, mut desired: Settings, max_rate: u16) -> Result<Settings, String> {
+    desired.rate = *ui
+        .rate
+        .get_selection()
+        .and_then(|index| RATES.get(index as usize))
+        .ok_or("Select a valid polling rate.")?;
+    desired.stages = u8::try_from(ui.stages.value()).map_err(|_| "Invalid DPI stage count.")?;
+    desired.competitive = ui.competitive.is_checked();
+    desired.scanning_20k = ui.scanning.is_checked();
+    desired.sleep = *ui
+        .sleep
+        .get_selection()
+        .and_then(|index| SLEEP_TIMES.get(index as usize))
+        .ok_or("Select a sleep time.")?;
+    desired.angle = i8::try_from(ui.angle.value()).map_err(|_| "Invalid angle.")?;
+    desired.angle_enabled = ui.angle_enabled.is_checked();
+    desired.current =
+        u8::try_from(ui.active_stage.value() - 1).map_err(|_| "Select a valid DPI stage.")?;
+    desired.debounce = u8::try_from(ui.debounce.value()).map_err(|_| "Invalid debounce value.")?;
+    desired.lod = match ui.lod.get_selection() {
+        Some(0) => 3,
+        Some(index @ 1..=2) => index as u8,
+        _ => return Err("Invalid lift-off distance.".into()),
+    };
+    desired.motion_sync = ui.motion_sync.is_checked();
+    desired.angle_snap = ui.angle_snap.is_checked();
+    desired.ripple = ui.ripple.is_checked();
+    for (dpi, row) in desired
+        .dpi
+        .iter_mut()
+        .zip(&ui.dpi)
+        .take(usize::from(desired.stages))
+    {
+        let value = row.2.get_value().round();
+        if !(0.0..=f64::from(u16::MAX)).contains(&value) {
+            return Err("Invalid DPI value.".into());
+        }
+        *dpi = value as u16;
+    }
+    for (i, (action, shortcut)) in ui.buttons.iter().enumerate() {
+        let action = action.get_selection().ok_or("Missing button action.")?;
+        if action == 8 {
+            continue;
+        }
+        if matches!(action, 9 | 10) {
+            let encoded = crate::bindings::encode(&shortcut.get_value(), action == 10)?;
+            if crate::bindings::decode(&desired.shortcuts[i]) != crate::bindings::decode(&encoded)
+                || desired.buttons[i] != [5, 0, 0]
+            {
+                desired.shortcuts[i] = encoded;
+            }
+            desired.buttons[i] = [5, 0, 0];
+            continue;
+        }
+        desired.buttons[i] = *settings::BUTTON_ACTIONS
+            .get(action as usize)
+            .ok_or("Invalid button action.")?;
+    }
+    desired.validate(max_rate)?;
+    Ok(desired)
+}
+
+fn show_settings(ui: &Ui, state: &State, snapshot: Snapshot) {
+    let settings = &snapshot.settings;
+    state.connected.set(true);
+    state.reset_armed.set(false);
+    *state.details.borrow_mut() = snapshot.details;
+    state.max_rate.set(snapshot.max_rate);
+    state.profiles_supported.set(snapshot.profile.is_some());
+    ui.profile
+        .set_selection(u32::from(snapshot.profile.unwrap_or(0)));
+    ui.rate.set_selection(
+        RATES
+            .iter()
+            .position(|rate| *rate == settings.rate)
+            .unwrap_or(3) as u32,
+    );
+    ui.lod.set_selection(if settings.lod == 3 {
+        0
+    } else {
+        u32::from(settings.lod)
+    });
+    ui.stages.set_value(i32::from(settings.stages));
+    ui.active_stage
+        .set_range(1, i32::from(settings.stages).max(1));
+    ui.active_stage.set_value(i32::from(settings.current) + 1);
+    for (row, dpi) in ui
+        .dpi
+        .iter()
+        .zip(&settings.dpi[..usize::from(settings.stages)])
+    {
+        set_dpi(row, *dpi);
+    }
+    ui.motion_sync.set_value(settings.motion_sync);
+    ui.angle_snap.set_value(settings.angle_snap);
+    ui.ripple.set_value(settings.ripple);
+    ui.competitive.set_value(settings.competitive);
+    ui.scanning.set_value(settings.scanning_20k);
+    ui.sleep.set_selection(
+        SLEEP_TIMES
+            .iter()
+            .position(|value| *value == settings.sleep)
+            .unwrap_or(5) as u32,
+    );
+    ui.angle_enabled.set_value(settings.angle_enabled);
+    ui.angle.set_value(i32::from(settings.angle));
+    ui.debounce.set_value(i32::from(settings.debounce));
+    ui.debounce_slider.set_value(i32::from(settings.debounce));
+    for (index, (action, shortcut)) in ui.buttons.iter().enumerate() {
+        let decoded = crate::bindings::decode(&settings.shortcuts[index]);
+        let selection = match decoded {
+            Some((media, _)) if settings.buttons[index] == [5, 0, 0] => {
+                if media {
+                    10
+                } else {
+                    9
+                }
+            }
+            _ => settings::BUTTON_ACTIONS
+                .iter()
+                .position(|action| *action == settings.buttons[index])
+                .unwrap_or(8),
+        };
+        action.set_selection(selection as u32);
+        shortcut.set_value(&decoded.map(|(_, text)| text).unwrap_or_default());
+    }
+    *state.current.borrow_mut() = Some(snapshot.settings);
 }
 
 #[derive(Clone)]
@@ -531,469 +570,444 @@ fn worker(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let ui = Configurator::new()?;
-    ui.set_software_version(env!("CARGO_PKG_VERSION").into());
     let (commands, receiver) = mpsc::channel();
     let (sender, events) = mpsc::channel();
     let handle = std::thread::spawn(move || worker(receiver, sender));
-    let current = Rc::new(RefCell::new(None::<Settings>));
-    let dpi_model = Rc::new(VecModel::<i32>::default());
-    ui.set_dpi_values(ModelRc::from(dpi_model.clone()));
-    #[cfg(test)]
-    let connection_attempts = Rc::new(std::cell::Cell::new(0_u32));
-    let shortcut_model = Rc::new(VecModel::<slint::SharedString>::default());
-    ui.set_shortcut_values(ModelRc::from(shortcut_model.clone()));
-    {
-        let model = shortcut_model.clone();
-        ui.on_shortcut_edited(move |index, text| {
-            if let Ok(index) = usize::try_from(index)
-                && index < model.row_count()
-            {
-                model.set_row_data(index, text);
-            }
-        });
-    }
-    {
-        let model = dpi_model.clone();
-        ui.on_stages_edited(move |count| {
-            if !(1..=8).contains(&count) {
-                return;
-            }
-            while model.row_count() < count as usize {
-                model.push(800);
-            }
-            while model.row_count() > count as usize {
-                model.remove(model.row_count() - 1);
-            }
-        });
-    }
-    let button_model = Rc::new(VecModel::<i32>::default());
-    ui.set_button_values(ModelRc::from(button_model.clone()));
-    {
-        let model = button_model.clone();
-        ui.on_button_edited(move |index, value| {
-            if let Ok(index) = usize::try_from(index)
-                && index < model.row_count()
-            {
-                model.set_row_data(index, value);
-            }
-        });
-    }
-    {
-        let model = dpi_model.clone();
-        ui.on_dpi_edited(move |index, value| {
-            if let Ok(index) = usize::try_from(index)
-                && index < model.row_count()
-            {
-                model.set_row_data(index, value);
-            }
-        });
-    }
-    {
-        let weak = ui.as_weak();
-        let tx = commands.clone();
-        #[cfg(test)]
-        let attempts = connection_attempts.clone();
-        ui.on_connect_mouse(move || {
-            if let Some(ui) = weak.upgrade() {
-                #[cfg(test)]
-                attempts.set(attempts.get() + 1);
-                ui.set_busy(true);
-                ui.set_status("Reading mouse settings…".into());
-                if tx.send(Command::Connect).is_err() {
-                    ui.set_busy(false);
-                    ui.set_connected(false);
-                    ui.set_status("The HID worker stopped. Restart the app.".into());
-                }
-            }
-        });
-    }
-    {
-        let weak = ui.as_weak();
-        let tx = commands.clone();
-        let current = current.clone();
-        let model = dpi_model.clone();
-        let buttons = button_model.clone();
-        let shortcuts = shortcut_model.clone();
-        ui.on_apply(move || {
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            let Some(mut desired) = current.borrow().clone() else {
-                return;
-            };
-            let build = (|| -> Result<(), String> {
-                let rates = [125, 250, 500, 1000, 2000, 4000, 8000];
-                desired.rate = *usize::try_from(ui.get_rate_index())
-                    .ok()
-                    .and_then(|i| rates.get(i))
-                    .ok_or("Select a valid polling rate.")?;
-                desired.stages =
-                    u8::try_from(ui.get_stage_count()).map_err(|_| "Invalid DPI stage count.")?;
-                desired.competitive = ui.get_competitive();
-                desired.scanning_20k = ui.get_scanning_20k();
-                desired.sleep = *usize::try_from(ui.get_sleep_index())
-                    .ok()
-                    .and_then(|index| [1, 3, 6, 12, 18, 30, 60, 180].get(index))
-                    .ok_or("Select a sleep time.")?;
-                desired.angle = i8::try_from(ui.get_angle()).map_err(|_| "Invalid angle.")?;
-                desired.angle_enabled = ui.get_angle_enabled();
-                desired.current = u8::try_from(ui.get_active_stage() - 1)
-                    .map_err(|_| "Select a valid DPI stage.")?;
-                desired.debounce = ui
-                    .get_debounce()
-                    .try_into()
-                    .map_err(|_| "Invalid debounce value.")?;
-                desired.lod = ui
-                    .get_lod()
-                    .try_into()
-                    .map_err(|_| "Invalid lift-off distance.")?;
-                desired.motion_sync = ui.get_motion_sync();
-                desired.angle_snap = ui.get_angle_snap();
-                desired.ripple = ui.get_ripple();
-                for i in 0..usize::from(desired.stages) {
-                    desired.dpi[i] = model
-                        .row_data(i)
-                        .ok_or("Missing DPI stage.")?
-                        .try_into()
-                        .map_err(|_| "Invalid DPI value.")?;
-                }
-                for i in 0..6 {
-                    let action = buttons.row_data(i).ok_or("Missing button action.")?;
-                    if action == 8 {
-                        continue;
-                    }
-                    if matches!(action, 9 | 10) {
-                        let text = shortcuts.row_data(i).ok_or("Missing shortcut text.")?;
-                        let encoded = crate::bindings::encode(text.as_str(), action == 10)?;
-                        if crate::bindings::decode(&desired.shortcuts[i])
-                            != crate::bindings::decode(&encoded)
-                            || desired.buttons[i] != [5, 0, 0]
-                        {
-                            desired.shortcuts[i] = encoded;
-                        }
-                        desired.buttons[i] = [5, 0, 0];
-                        continue;
-                    }
-                    desired.buttons[i] = *usize::try_from(action)
-                        .ok()
-                        .and_then(|i| settings::BUTTON_ACTIONS.get(i))
-                        .ok_or("Invalid button action.")?;
-                }
-                desired.validate(ui.get_max_rate() as u16)
-            })();
-            if let Err(error) = build {
-                ui.set_status(error.into());
-                return;
-            }
-            ui.set_busy(true);
-            ui.set_status("Saving changed settings and checking readback…".into());
-            if tx.send(Command::Apply(Box::new(desired))).is_err() {
-                ui.set_busy(false);
-                ui.set_connected(false);
-                ui.set_status("The HID worker stopped. Restart the app.".into());
-            }
-        });
-    }
-    {
-        let weak = ui.as_weak();
-        let tx = commands.clone();
-        ui.on_switch_profile(move || {
-            if let Some(ui) = weak.upgrade() {
-                ui.set_busy(true);
-                ui.set_status("Loading profile; pending edits will be discarded…".into());
-                if tx
-                    .send(Command::Profile(ui.get_profile_index() as u8))
-                    .is_err()
-                {
-                    ui.set_busy(false);
-                    ui.set_status("The HID worker stopped. Restart the app.".into());
-                }
-            }
-        });
-    }
-    {
-        let weak = ui.as_weak();
-        let tx = commands.clone();
-        ui.on_factory_reset(move || {
-            if let Some(ui) = weak.upgrade() {
-                ui.set_busy(true);
-                ui.set_status("Restoring factory settings…".into());
-                if tx.send(Command::Reset).is_err() {
-                    ui.set_busy(false);
-                    ui.set_status("The HID worker stopped. Restart the app.".into());
-                }
-            }
-        });
-    }
-    {
-        let weak = ui.as_weak();
-        let tx = commands.clone();
-        ui.on_pair_receiver(move || {
-            if let Some(ui) = weak.upgrade() {
-                ui.set_busy(true); ui.set_status("Pairing receiver. Hold left, right and middle buttons for 3 seconds. Waiting up to 20 seconds…".into());
-                if tx.send(Command::Pair).is_err() { ui.set_busy(false); ui.set_status("The HID worker stopped. Restart the app.".into()); }
-            }
-        });
-    }
-    let timer = slint::Timer::default();
-    let weak = ui.as_weak();
-    let mut next_connect = None;
-    timer.start(
-        slint::TimerMode::Repeated,
-        Duration::from_millis(100),
-        move || {
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            while let Ok(event) = events.try_recv() {
-                ui.set_busy(false);
-                match event.result {
-                    Ok(state) => {
-                        next_connect = None;
-                        ui.set_connected(true);
-                        ui.set_device_name(state.label.into());
-                        ui.set_details(state.details.into());
-                        ui.set_max_rate(i32::from(state.max_rate));
-                        ui.set_stage_count(i32::from(state.settings.stages));
-                        ui.set_active_stage(i32::from(state.settings.current) + 1);
-                        ui.set_rate_index(
-                            [125, 250, 500, 1000, 2000, 4000, 8000]
-                                .iter()
-                                .position(|r| *r == state.settings.rate)
-                                .unwrap_or(3) as i32,
-                        );
-                        ui.set_debounce(i32::from(state.settings.debounce));
-                        ui.set_lod(i32::from(state.settings.lod));
-                        ui.set_motion_sync(state.settings.motion_sync);
-                        ui.set_angle_snap(state.settings.angle_snap);
-                        ui.set_ripple(state.settings.ripple);
-                        ui.set_reset_armed(false);
-                        ui.set_competitive(state.settings.competitive);
-                        ui.set_scanning_20k(state.settings.scanning_20k);
-                        ui.set_sleep_index(
-                            [1, 3, 6, 12, 18, 30, 60, 180]
-                                .iter()
-                                .position(|value| *value == state.settings.sleep)
-                                .unwrap_or(5) as i32,
-                        );
-                        ui.set_angle(i32::from(state.settings.angle));
-                        ui.set_angle_enabled(state.settings.angle_enabled);
-                        ui.set_profiles_supported(state.profile.is_some());
-                        ui.set_profile_index(i32::from(state.profile.unwrap_or(0)));
-                        shortcut_model.set_vec(
-                            state
-                                .settings
-                                .shortcuts
-                                .iter()
-                                .map(|bytes| {
-                                    crate::bindings::decode(bytes)
-                                        .map(|(_, text)| text)
-                                        .unwrap_or_default()
-                                        .into()
-                                })
-                                .collect::<Vec<_>>(),
-                        );
-                        dpi_model.set_vec(
-                            state.settings.dpi[..usize::from(state.settings.stages)]
-                                .iter()
-                                .map(|v| i32::from(*v))
-                                .collect::<Vec<_>>(),
-                        );
-                        button_model.set_vec(
-                            state
-                                .settings
-                                .buttons
-                                .iter()
-                                .enumerate()
-                                .map(|(index, binding)| {
-                                    if *binding == [5, 0, 0]
-                                        && let Some((media, _)) = crate::bindings::decode(
-                                            &state.settings.shortcuts[index],
-                                        )
-                                    {
-                                        return if media { 10 } else { 9 };
-                                    }
-                                    settings::BUTTON_ACTIONS
-                                        .iter()
-                                        .position(|action| action == binding)
-                                        .unwrap_or(8) as i32
-                                })
-                                .collect::<Vec<_>>(),
-                        );
-                        *current.borrow_mut() = Some(state.settings);
-                        ui.set_status(event.message.into());
-                    }
-                    Err(error) => {
-                        ui.set_connected(false);
-                        ui.set_device_name("Disconnected".into());
-                        ui.set_connection_status(if event.connection_attempt {
-                            "Waiting for mouse. Retrying automatically…".into()
-                        } else {
-                            "Operation failed. Reconnect to inspect current settings.".into()
-                        });
-                        ui.set_status(error.into());
-                        next_connect = event
-                            .connection_attempt
-                            .then(|| std::time::Instant::now() + Duration::from_secs(2));
-                        *current.borrow_mut() = None;
-                    }
-                }
-            }
-            if !ui.get_connected()
-                && !ui.get_busy()
-                && next_connect.is_some_and(|deadline| std::time::Instant::now() >= deadline)
-            {
-                next_connect = None;
-                ui.invoke_connect_mouse();
-            }
-        },
-    );
-    #[cfg(test)]
-    let smoke_result = Rc::new(RefCell::new(Ok::<(), String>(())));
-    #[cfg(test)]
-    let smoke_timer = {
-        let timer = slint::Timer::default();
-        let weak = ui.as_weak();
-        let result = smoke_result.clone();
-        let page = std::cell::Cell::new(0);
-        timer.start(
-            slint::TimerMode::Repeated,
-            Duration::from_secs(2),
-            move || {
-                let ui = weak.upgrade().unwrap();
-                *result.borrow_mut() = (|| {
-                    let image = ui.window().take_snapshot().map_err(|e| e.to_string())?;
-                    let mut bytes = image.width().to_le_bytes().to_vec();
-                    bytes.extend(image.height().to_le_bytes());
-                    bytes.extend(image.as_bytes());
-                    std::fs::create_dir_all(".local/research").map_err(|e| e.to_string())?;
-                    if page.get() == 0 {
-                        std::fs::write(".local/research/gui-smoke.rgba", &bytes)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    std::fs::write(
-                        format!(".local/research/gui-smoke-{}.rgba", page.get()),
-                        bytes,
-                    )
-                    .map_err(|e| e.to_string())?;
-                    let scale = ui.window().scale_factor();
-                    let width = image.width() as usize;
-                    let left = (ui.get_connection_button_x() * scale) as usize;
-                    let right = (left + (104.0 * scale) as usize).min(width);
-                    let visible_pixels = image
-                        .as_slice()
-                        .chunks_exact(width)
-                        .skip((ui.get_connection_button_y() * scale) as usize)
-                        .take((24.0 * scale) as usize)
-                        .flat_map(|row| row[left..right].iter())
-                        .filter(|pixel| pixel.r < 190 && pixel.g < 190 && pixel.b < 190)
-                        .count();
-                    if visible_pixels < 20 {
-                        return Err("The connection button did not render.".into());
-                    }
-                    if page.get() == 3 && !ui.get_connected() && connection_attempts.get() < 2 {
-                        return Err("The disconnected mouse was not retried automatically.".into());
-                    }
-                    println!(
-                        "Connected: {}. Attempts: {}. {}",
-                        ui.get_connected(),
-                        connection_attempts.get(),
-                        ui.get_status()
-                    );
-                    if page.get() == 3 {
-                        // Replace the save callback so testing APPLY cannot write mouse settings.
-                        let applied = Rc::new(std::cell::Cell::new(false));
-                        let called = applied.clone();
-                        ui.on_apply(move || called.set(true));
-                        ui.set_connected(true);
-                        ui.set_busy(false);
-                        let position = slint::LogicalPosition::new(597.0, 690.0);
-                        let button = slint::platform::PointerEventButton::Left;
-                        ui.window()
-                            .dispatch_event(slint::platform::WindowEvent::PointerPressed {
-                                position,
-                                button,
-                            });
-                        ui.window()
-                            .dispatch_event(slint::platform::WindowEvent::PointerReleased {
-                                position,
-                                button,
-                            });
-                        if !applied.get() {
-                            return Err("APPLY did not save immediately after one click.".into());
-                        }
-                        ui.set_details("Firmware v2.22 · Battery 100%".into());
-                        ui.set_connection_status(
-                            "Waiting for mouse. Retrying automatically…".into(),
-                        );
-                        ui.set_connected(false);
-                        ui.set_debounce(7);
-                        if !ui.get_info_text().starts_with("Waiting for mouse") {
-                            return Err("The disconnected status did not update.".into());
-                        }
-                        ui.set_busy(true);
-                        if ui.get_info_text() != "Reading mouse settings…" {
-                            return Err("The retry status did not update.".into());
-                        }
-                        ui.set_connected(true);
-                        ui.set_busy(false);
-                        if ui.get_info_text() != "Firmware v2.22 · Battery 100%" {
-                            return Err("The waiting status remained after connection.".into());
-                        }
-                        if ui.get_debounce() != 7 {
-                            return Err("The status update replaced pending edits.".into());
-                        }
-                    }
-                    Ok(())
-                })();
-                if result.borrow().is_err() || page.get() == 3 {
-                    slint::quit_event_loop().unwrap();
-                } else {
-                    page.set(page.get() + 1);
-                    let position = slint::LogicalPosition::new(
-                        [49.0, 138.0, 233.0, 328.0][page.get() as usize],
-                        154.0,
-                    );
-                    let button = slint::platform::PointerEventButton::Left;
-                    ui.window()
-                        .dispatch_event(slint::platform::WindowEvent::PointerPressed {
-                            position,
-                            button,
-                        });
-                    ui.window()
-                        .dispatch_event(slint::platform::WindowEvent::PointerReleased {
-                            position,
-                            button,
-                        });
-                    if ui.get_page() != page.get() {
-                        *result.borrow_mut() = Err("A tab did not respond to a click.".into());
-                        slint::quit_event_loop().unwrap();
-                    }
-                }
-            },
-        );
-        timer
-    };
-    ui.invoke_connect_mouse();
-    ui.run()?;
-    #[cfg(test)]
-    drop(smoke_timer);
-    // Closing the window releases callbacks and their senders before the worker is joined.
-    timer.stop();
-    drop(ui);
-    drop(commands);
+    wxdragon::main(move |_| build(commands, events))?;
+    // Window destruction drops every handler and its sender, so the worker sees a closed channel.
     handle.join().map_err(|_| "The HID worker panicked.")?;
-    #[cfg(test)]
-    smoke_result.borrow().clone()?;
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    #[ignore = "Requires a desktop; opens a read-only Scyrox session."]
-    fn window_renders_controls() {
-        super::run().unwrap();
+fn build(commands: mpsc::Sender<Command>, events: mpsc::Receiver<Event>) {
+    let frame = Frame::builder()
+        .with_title("Scycocks · Scyrox V8 Configuration Tool")
+        .build();
+    let root = Panel::builder(&frame).build();
+    let main = BoxSizer::builder(Orientation::Vertical).build();
+
+    let info_box =
+        StaticBoxSizerBuilder::new_with_label(Orientation::Vertical, &root, "Info").build();
+    let info_parent = info_box.get_static_box().expect("Info box");
+    let info = text(&info_parent, "");
+    let version = text(
+        &info_parent,
+        &format!("Software version: {}", env!("CARGO_PKG_VERSION")),
+    );
+    let connect = button(&info_parent, "Connect mouse");
+    info_box.add(&info, 0, SizerFlag::Expand | SizerFlag::All, 6);
+    info_box.add(&version, 0, SizerFlag::Left | SizerFlag::Right, 6);
+    info_box.add(&connect, 0, SizerFlag::AlignRight | SizerFlag::All, 6);
+    main.add_sizer(&info_box, 0, SizerFlag::Expand | SizerFlag::All, 10);
+
+    let tabs = Notebook::builder(&root).build();
+    main.add(
+        &tabs,
+        1,
+        SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right,
+        10,
+    );
+
+    let basic = Panel::builder(&tabs).build();
+    let page = BoxSizer::builder(Orientation::Vertical).build();
+    let (r, _) = row(&page, &basic, "Profile");
+    let profile = choice(
+        &basic,
+        &["Profile 1", "Profile 2", "Profile 3", "Profile 4"],
+    );
+    let load_profile = button(&basic, "Load profile");
+    put(&r, &profile);
+    put(&r, &load_profile);
+    let (r, _) = row(&page, &basic, "Polling rate");
+    let rate = choice(
+        &basic,
+        &[
+            "125 Hz", "250 Hz", "500 Hz", "1000 Hz", "2000 Hz", "4000 Hz", "8000 Hz",
+        ],
+    );
+    let max_rate = text(&basic, "Maximum: 8000 Hz");
+    put(&r, &rate);
+    put(&r, &max_rate);
+    let (r, _) = row(&page, &basic, "Lift-off distance");
+    let lod = choice(&basic, &["0.7 mm", "1 mm", "2 mm"]);
+    put(&r, &lod);
+    let (r, _) = row(&page, &basic, "Active DPI stage");
+    let active_stage = SpinCtrl::builder(&basic).with_range(1, 8).build();
+    let stages = SpinCtrl::builder(&basic).with_range(1, 8).build();
+    put(&r, &active_stage);
+    put(&r, &text(&basic, "Stages"));
+    put(&r, &stages);
+    let dpi = std::array::from_fn(|index| {
+        let (r, caption) = row(&page, &basic, &format!("DPI {}", index + 1));
+        let slider = Slider::builder(&basic)
+            .with_min_value(1)
+            .with_max_value(600)
+            .with_value(16)
+            .build();
+        let spin = SpinCtrlDouble::builder(&basic)
+            .with_range(50.0, 30000.0)
+            .with_increment(50.0)
+            .with_initial_value(800.0)
+            .build();
+        spin.set_digits(0);
+        r.add(
+            &slider,
+            1,
+            SizerFlag::AlignCenterVertical | SizerFlag::Left,
+            8,
+        );
+        put(&r, &spin);
+        slider.on_slider(move |_| spin.set_value(f64::from(slider.value() * 50)));
+        spin.on_value_changed(move |_| slider.set_value((spin.get_value() / 50.0).round() as i32));
+        (caption, slider, spin)
+    });
+    basic.set_sizer(page, true);
+    tabs.add_page(&basic, "Basic", true, None);
+
+    let advanced = Panel::builder(&tabs).build();
+    let page = BoxSizer::builder(Orientation::Vertical).build();
+    let check = |label: &str| {
+        let check = CheckBox::builder(&advanced).with_label(label).build();
+        page.add(&check, 0, SizerFlag::All, 6);
+        check
+    };
+    let motion_sync = check("Motion Sync");
+    let angle_snap = check("Angle snapping");
+    let ripple = check("Ripple control");
+    let competitive = check("Competitive Mode");
+    let scanning = check("20K sensor scanning");
+    note(
+        &page,
+        &advanced,
+        "Competitive Mode and 20K scanning use more battery.",
+    );
+    let (r, _) = row(&page, &advanced, "Sleep time");
+    let sleep = choice(
+        &advanced,
+        &[
+            "10 seconds",
+            "30 seconds",
+            "1 minute",
+            "2 minutes",
+            "3 minutes",
+            "5 minutes",
+            "10 minutes",
+            "30 minutes",
+        ],
+    );
+    put(&r, &sleep);
+    let r = BoxSizer::builder(Orientation::Horizontal).build();
+    let angle_enabled = CheckBox::builder(&advanced)
+        .with_label("Angle tuning")
+        .build();
+    angle_enabled.set_min_size(Size::new(110, -1));
+    let angle = SpinCtrl::builder(&advanced).with_range(-30, 30).build();
+    r.add(&angle_enabled, 0, SizerFlag::AlignCenterVertical, 0);
+    put(&r, &angle);
+    put(&r, &text(&advanced, "degrees"));
+    page.add_sizer(&r, 0, SizerFlag::All, 6);
+    advanced.set_sizer(page, true);
+    tabs.add_page(&advanced, "Advanced Sensor", false, None);
+
+    let buttons_page = Panel::builder(&tabs).build();
+    let page = BoxSizer::builder(Orientation::Vertical).build();
+    let (r, _) = row(&page, &buttons_page, "Debounce (ms)");
+    let debounce_slider = Slider::builder(&buttons_page)
+        .with_min_value(0)
+        .with_max_value(30)
+        .build();
+    let debounce = SpinCtrl::builder(&buttons_page).with_range(0, 30).build();
+    r.add(
+        &debounce_slider,
+        1,
+        SizerFlag::AlignCenterVertical | SizerFlag::Left,
+        8,
+    );
+    put(&r, &debounce);
+    debounce_slider.on_slider(move |_| debounce.set_value(debounce_slider.value()));
+    debounce.on_value_changed(move |_| debounce_slider.set_value(debounce.value()));
+    note(&page, &buttons_page, "Applies to all buttons.");
+    note(
+        &page,
+        &buttons_page,
+        "Pairing: hold left, right and middle buttons for 3 seconds until the light flashes. Keep the mouse close to the receiver.",
+    );
+    let r = BoxSizer::builder(Orientation::Horizontal).build();
+    let pair = button(&buttons_page, "Pair receiver");
+    let reset = button(&buttons_page, "Click again to reset");
+    r.add(&pair, 0, SizerFlag::All, 0);
+    put(&r, &reset);
+    page.add_sizer(&r, 0, SizerFlag::All, 6);
+    note(
+        &page,
+        &buttons_page,
+        "Loading a profile or resetting discards pending edits.",
+    );
+    buttons_page.set_sizer(page, true);
+    tabs.add_page(&buttons_page, "Buttons", false, None);
+
+    let mapping = Panel::builder(&tabs).build();
+    let page = BoxSizer::builder(Orientation::Vertical).build();
+    let buttons = BUTTON_NAMES.map(|name| {
+        let (r, _) = row(&page, &mapping, name);
+        let action = choice(
+            &mapping,
+            &[
+                "Left click",
+                "Right click",
+                "Middle click",
+                "Back",
+                "Forward",
+                "Cycle DPI",
+                "Cycle polling rate",
+                "Disabled",
+                "Keep existing action",
+                "Keyboard shortcut",
+                "Media key",
+            ],
+        );
+        let shortcut = TextCtrl::builder(&mapping).build();
+        shortcut.set_min_size(Size::new(200, -1));
+        put(&r, &action);
+        put(&r, &shortcut);
+        (action, shortcut)
+    });
+    note(
+        &page,
+        &mapping,
+        "Keyboard: Ctrl/Shift/Alt/Win + one key, such as Ctrl+Shift+A. Media: VolumeUp, VolumeDown, Mute, PlayPause, Stop, NextTrack, PreviousTrack, BrowserBack, BrowserForward, BrowserHome, BrowserRefresh, Calculator.",
+    );
+    mapping.set_sizer(page, true);
+    tabs.add_page(&mapping, "Button Mapping", false, None);
+
+    let status = text(&root, "Settings remain unchanged until you select Apply.");
+    main.add(&status, 0, SizerFlag::Expand | SizerFlag::All, 10);
+    let apply = button(&root, "Working…");
+    main.add(
+        &apply,
+        0,
+        SizerFlag::AlignRight | SizerFlag::Left | SizerFlag::Right | SizerFlag::Bottom,
+        10,
+    );
+    root.set_sizer(main, true);
+    let frame_sizer = BoxSizer::builder(Orientation::Vertical).build();
+    frame_sizer.add(&root, 1, SizerFlag::Expand, 0);
+    // Fit while every optional row is visible so the minimum size covers 8 DPI stages.
+    frame.set_sizer_and_fit(frame_sizer, true);
+
+    let ui = Ui {
+        root,
+        basic,
+        mapping,
+        info,
+        connect,
+        status,
+        apply,
+        profile,
+        load_profile,
+        rate,
+        max_rate,
+        lod,
+        active_stage,
+        stages,
+        dpi,
+        motion_sync,
+        angle_snap,
+        ripple,
+        competitive,
+        scanning,
+        sleep,
+        angle_enabled,
+        angle,
+        debounce_slider,
+        debounce,
+        pair,
+        reset,
+        buttons,
+    };
+    let state = Rc::new(State::default());
+    *state.connection_status.borrow_mut() = "Connect a Scyrox V8 or its receiver.".into();
+    for (choice, index) in [(profile, 0), (rate, 3), (lod, 1), (sleep, 5)] {
+        choice.set_selection(index);
     }
+    for (action, _) in buttons {
+        action.set_selection(8);
+    }
+
+    {
+        let (state, commands) = (state.clone(), commands.clone());
+        connect.on_click(move |_| {
+            send(
+                &ui,
+                &state,
+                &commands,
+                Command::Connect,
+                "Reading mouse settings…",
+            );
+        });
+    }
+    {
+        let (state, commands) = (state.clone(), commands.clone());
+        apply.on_click(move |_| {
+            let Some(current) = state.current.borrow().clone() else {
+                return;
+            };
+            match desired(&ui, current, state.max_rate.get()) {
+                Ok(desired) => send(
+                    &ui,
+                    &state,
+                    &commands,
+                    Command::Apply(Box::new(desired)),
+                    "Saving changed settings and checking readback…",
+                ),
+                Err(error) => set_status(&ui, &error),
+            }
+        });
+    }
+    {
+        let (state, commands) = (state.clone(), commands.clone());
+        load_profile.on_click(move |_| {
+            let profile = ui.profile.get_selection().unwrap_or(0) as u8;
+            send(
+                &ui,
+                &state,
+                &commands,
+                Command::Profile(profile),
+                "Loading profile; pending edits will be discarded…",
+            );
+        });
+    }
+    {
+        let (state, commands) = (state.clone(), commands.clone());
+        pair.on_click(move |_| {
+            send(
+                &ui,
+                &state,
+                &commands,
+                Command::Pair,
+                "Pairing receiver. Hold left, right and middle buttons for 3 seconds. Waiting up to 20 seconds…",
+            );
+        });
+    }
+    {
+        let (state, commands) = (state.clone(), commands.clone());
+        reset.on_click(move |_| {
+            if state.reset_armed.replace(false) {
+                send(
+                    &ui,
+                    &state,
+                    &commands,
+                    Command::Reset,
+                    "Restoring factory settings…",
+                );
+            } else {
+                state.reset_armed.set(true);
+                set_status(
+                    &ui,
+                    "Factory reset clears stored settings. Click again to reset.",
+                );
+                sync(&ui, &state);
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        tabs.on_page_changed(move |_| {
+            state.reset_armed.set(false);
+            sync(&ui, &state);
+        });
+    }
+    {
+        let state = state.clone();
+        stages.on_value_changed(move |_| {
+            let count = usize::try_from(ui.stages.value()).unwrap_or(1);
+            for row in ui.dpi.iter().take(count).filter(|row| !row.1.is_shown()) {
+                set_dpi(row, 800);
+            }
+            ui.active_stage.set_range(1, ui.stages.value().max(1));
+            sync(&ui, &state);
+        });
+    }
+    {
+        let state = state.clone();
+        competitive.on_toggled(move |_| {
+            if !ui.competitive.is_checked() {
+                ui.scanning.set_value(false);
+            }
+            sync(&ui, &state);
+        });
+    }
+    {
+        let state = state.clone();
+        angle_enabled.on_toggled(move |_| sync(&ui, &state));
+    }
+    for (action, _) in buttons {
+        let state = state.clone();
+        action.on_selection_changed(move |_| sync(&ui, &state));
+    }
+
+    let timer = Timer::new(&frame);
+    {
+        let (state, commands) = (state.clone(), commands.clone());
+        let mut next_connect = None;
+        timer.on_tick(move |_| {
+            let mut changed = false;
+            while let Ok(event) = events.try_recv() {
+                changed = true;
+                state.busy.set(false);
+                match event.result {
+                    Ok(snapshot) => {
+                        next_connect = None;
+                        show_settings(&ui, &state, snapshot);
+                        set_status(&ui, &event.message);
+                    }
+                    Err(error) => {
+                        state.connected.set(false);
+                        *state.connection_status.borrow_mut() = if event.connection_attempt {
+                            "Waiting for mouse. Retrying automatically…".into()
+                        } else {
+                            "Operation failed. Reconnect to inspect current settings.".into()
+                        };
+                        set_status(&ui, &error);
+                        next_connect = event
+                            .connection_attempt
+                            .then(|| Instant::now() + Duration::from_secs(2));
+                        *state.current.borrow_mut() = None;
+                    }
+                }
+            }
+            if changed {
+                sync(&ui, &state);
+            }
+            if !state.connected.get()
+                && !state.busy.get()
+                && next_connect.is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                next_connect = None;
+                send(
+                    &ui,
+                    &state,
+                    &commands,
+                    Command::Connect,
+                    "Reading mouse settings…",
+                );
+            }
+        });
+    }
+    timer.start(100, false);
+    frame.on_close(move |event| {
+        timer.stop();
+        event.skip(true);
+    });
+
+    sync(&ui, &state);
+    send(
+        &ui,
+        &state,
+        &commands,
+        Command::Connect,
+        "Reading mouse settings…",
+    );
+    frame.show(true);
+    frame.centre();
 }

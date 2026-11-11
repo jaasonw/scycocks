@@ -1,6 +1,6 @@
 # Scycocks
 
-Offline Windows configurator for the Scyrox V8, written in Rust with a Slint interface. It talks to the mouse through the HID driver Windows already provides. No browser, account, background service, or vendor application is required.
+Offline Windows configurator for the Scyrox V8, written in Rust with a native wxWidgets interface (through wxDragon). It talks to the mouse through the HID driver Windows already provides. No browser, account, background service, or vendor application is required.
 
 ## Run
 
@@ -23,7 +23,7 @@ The app also reads settings after every save. If the mouse is absent or asleep, 
 
 ## Controls
 
-The layout follows a classic Windows utility: an Info box, four tabs, and an APPLY button.
+The window uses standard Windows controls: an Info box, four tabs, and an APPLY button.
 
 - **Basic:** four on-device profiles where the firmware supports them, polling rate limited by the connected device, 0.7/1/2 mm lift-off distance, one to eight DPI stages from 50 to 30,000 in steps of 50, the active stage, and a slider per stage with a numeric input. New stages start at 800 DPI.
 - **Advanced Sensor:** Motion Sync, angle snapping, ripple control, Competitive Mode, 20K scanning, sleep time, and angle tuning.
@@ -63,9 +63,13 @@ cargo run --no-default-features -- --inspect
 
 ## Development
 
-Requires the stable Rust toolchain and the Windows MSVC linker and build tools.
+Requires the stable Rust toolchain, the Windows MSVC linker and build tools, CMake, and LLVM. The first GUI build downloads the wxWidgets source and compiles it, which takes a few minutes. Put `cmake` on `PATH` or set `CMAKE` to `cmake.exe`. Visual Studio Build Tools ships a copy. Set `LIBCLANG_PATH` if LLVM's `libclang.dll` is not on `PATH`.
 
-`.cargo/config.toml` selects Slint's `fluent-light` widget style. With the default style, the software renderer drew invisible controls on the tested Windows system.
+```powershell
+winget install Kitware.CMake LLVM.LLVM
+```
+
+`build.rs` embeds a Windows manifest so the controls use the system theme and scale on high-DPI displays.
 
 ```powershell
 cargo fmt --check
@@ -73,13 +77,7 @@ cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
 ```
 
-The desktop smoke test opens the real window, clicks through all four tabs, checks the connection button and the single-click APPLY action, and saves rendered images under `.local/research/`. It prints the connection status. The APPLY check replaces the save callback, so the test does not write mouse settings:
-
-```powershell
-cargo test --locked window_renders_controls -- --ignored --nocapture
-```
-
-Hardware-independent packet and settings tests run without compiling Slint:
+Hardware-independent packet and settings tests run without compiling wxWidgets:
 
 ```powershell
 cargo test --no-default-features --locked
@@ -91,8 +89,6 @@ Protocol sources, artifact hashes, firmware findings, and investigation limits a
 
 This project's source code is MIT licensed; see [LICENSE](LICENSE).
 
-The app uses Slint under the [Slint Royalty-free Desktop, Mobile, and Web Applications License 2.0](https://github.com/slint-ui/slint/blob/master/LICENSES/LicenseRef-Slint-Royalty-free-2.0.md), which requires attribution. That requirement is met by the badge below, per section 2(b) of the license. The MIT license covers this project's own code. Distributed binaries also carry Slint's license terms. Other dependencies keep their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The GUI statically links wxWidgets under the [wxWindows Library Licence](https://www.wxwidgets.org/about/licence/). That licence permits distribution of binaries under the distributor's own terms. Other dependencies keep their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 The MIT license does not grant rights to vendor firmware or artwork.
-
-[<img src="https://raw.githubusercontent.com/slint-ui/slint/master/logo/MadeWithSlint-logo-whitebg.png" width="120" alt="Built with Slint">](https://slint.dev)

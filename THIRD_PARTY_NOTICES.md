@@ -3,18 +3,11 @@
 Scycocks source code is MIT licensed. Distributed binaries include the
 components below and carry their terms as well.
 
-## Slint
+## wxWidgets
 
-- Crates: `slint`, resolved version recorded in `Cargo.lock`.
-- License chosen: [Slint Royalty-free Desktop, Mobile, and Web Applications License 2.0](https://github.com/slint-ui/slint/blob/master/LICENSES/LicenseRef-Slint-Royalty-free-2.0.md).
-- Alternatives available from SixtyFPS GmbH: GPLv3, or a commercial license.
-- Attribution: the "Built with Slint" badge at the top of the README satisfies section 2(b) of the royalty-free license. It is a link to https://slint.dev and it comes from the `logo/` directory of the upstream Slint repository.
-- Copyright: SixtyFPS GmbH, Oranienburger Str. 44, 16540 Hohen Neuendorf, Germany.
-
-Keep the badge and this notice in place when you redistribute the app or a
-build of it. Do not ship Slint on its own, and do not publish an app that
-exposes Slint's APIs, because the royalty-free license excludes both.
-Applications for embedded systems fall outside this license.
+- Crates: `wxdragon` and `wxdragon-sys` (MIT OR Apache-2.0), resolved versions recorded in `Cargo.lock`. They statically link wxWidgets.
+- License: [wxWindows Library Licence 3.1](https://www.wxwidgets.org/about/licence/). It is the LGPL with an exception that permits distribution of binary forms under the user's own terms.
+- Copyright: Julian Smart, Robert Roebling, and other wxWidgets contributors.
 
 ## Other dependencies
 
