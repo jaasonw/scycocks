@@ -1,0 +1,226 @@
+# Scyrox V8. Protocol notes: docs/protocol.md.
+name = "Scyrox V8"
+family = "scyrox"
+# Shortcut slots for six buttons follow the 256-byte settings block.
+size = 448
+
+[[match]]
+vid = 0x3554
+pid = [0xF5F4, 0xF5F7, 0xF517, 0xF5F6, 0xF515]
+usage_page = 0xFF02
+usage = 2
+
+[[identify]]
+frame = [0x01, 0, 0, 0, 8, 0x17, 0x39, 0x53, 0x71, 0, 0, 0, 0]
+facts = { company = 9, model = 10, connection = 11 }
+
+[[require]]
+when = { company = 62, model = [1, 10, 11] }
+error = "Unsupported model identity. Only the Scyrox V8 is enabled; V6 and PAW3955 models are rejected."
+
+[[require]]
+when = { connection = [0, 1, 2, 3, 4, 5] }
+error = "Unknown connection type. No settings were changed."
+
+# Connection types 0 and 2 stop at 1000 Hz, 1 at 4000 Hz, 4 at 2000 Hz. 2 and 3 are wired.
+[[variant]]
+when = { connection = [0, 2] }
+field = [{ id = "rate", limit = 4 }]
+
+[[variant]]
+when = { connection = 1 }
+field = [{ id = "rate", limit = 6 }]
+
+[[variant]]
+when = { connection = 4 }
+field = [{ id = "rate", limit = 5 }]
+
+[[variant]]
+when = { connection = [2, 3] }
+pair = { enabled = false }
+
+[online]
+frame = [0x03, 0, 0, 0, 0]
+byte = 5
+equals = 1
+error = "The receiver is connected, but the mouse is offline."
+
+[read]
+frame = [0x08, 0, "addr16be", "len"]
+chunk = 10
+data_at = 5
+
+[write]
+frame = [0x07, 0, "addr16be", "len", "data"]
+chunk = 10
+verify_each = true
+
+[[status]]
+label = "Firmware"
+frame = [0x12, 0, 0, 0, 0]
+format = "v{5}.{6:02x}"
+
+[[status]]
+label = "Battery"
+frame = [0x04, 0, 0, 0, 0]
+format = "{5}%"
+charging = 6
+
+[profiles]
+count = 4
+current = { frame = [0x0E, 0, 0, 0, 0], byte = 5 }
+set = [0x0F, 0, 0, 0, 1, "profile"]
+
+[reset]
+frame = { frame = [0x09, 0, 0, 0, 0], timeout_ms = 6000 }
+page = "Buttons"
+
+[pair]
+page = "Buttons"
+help = "Connect only the receiver. Hold left, right and middle buttons for 3 seconds until the light flashes, keep the mouse close, then select Pair receiver."
+# The vendor sends length 2 but places the company ID in the third data byte.
+start = [0x05, 0, 0, 0, 2, 0, 0, 62]
+poll = [0x06, 0, 0, 0, 0]
+byte = 5
+success = 3
+failure = 2
+timeout_s = 20
+
+[[field]]
+id = "dpi"
+kind = "dpi"
+label = "DPI"
+page = "Basic"
+stages = 8
+min = 50
+max = 30000
+step = 50
+count = { offset = 2, codec = "scyrox_checked" }
+active = { offset = 4, codec = "scyrox_checked" }
+x = { offset = 12, stride = 4, codec = "scyrox_dpi" }
+
+[[field]]
+id = "rate"
+kind = "choice"
+label = "Polling rate"
+page = "Basic"
+at = { offset = 0, codec = "scyrox_checked" }
+options = [
+    { label = "125 Hz", value = 8 },
+    { label = "250 Hz", value = 4 },
+    { label = "500 Hz", value = 2 },
+    { label = "1000 Hz", value = 1 },
+    { label = "2000 Hz", value = 16 },
+    { label = "4000 Hz", value = 32 },
+    { label = "8000 Hz", value = 64 },
+]
+
+[[field]]
+id = "lod"
+kind = "choice"
+label = "Lift-off distance"
+page = "Basic"
+at = { offset = 10, codec = "scyrox_checked" }
+options = [
+    { label = "0.7 mm", value = 3 },
+    { label = "1 mm", value = 1 },
+    { label = "2 mm", value = 2 },
+]
+
+[[field]]
+id = "motion_sync"
+kind = "toggle"
+label = "Motion Sync"
+page = "Advanced Sensor"
+at = { offset = 171, codec = "scyrox_checked" }
+
+[[field]]
+id = "angle_snap"
+kind = "toggle"
+label = "Angle snapping"
+page = "Advanced Sensor"
+at = { offset = 175, codec = "scyrox_checked" }
+
+[[field]]
+id = "ripple"
+kind = "toggle"
+label = "Ripple control"
+page = "Advanced Sensor"
+at = { offset = 177, codec = "scyrox_checked" }
+
+[[field]]
+id = "competitive"
+kind = "toggle"
+label = "Competitive Mode"
+page = "Advanced Sensor"
+at = { offset = 181, codec = "scyrox_checked" }
+
+[[field]]
+id = "scanning_20k"
+kind = "toggle"
+label = "20K sensor scanning"
+page = "Advanced Sensor"
+help = "Competitive Mode and 20K scanning use more battery."
+requires = "competitive"
+at = { offset = 8, codec = "scyrox_checked" }
+
+[[field]]
+id = "sleep"
+kind = "choice"
+label = "Sleep time"
+page = "Advanced Sensor"
+# The performance timeout mirrors the sleep time.
+at = [{ offset = 173, codec = "scyrox_checked" }, { offset = 183, codec = "scyrox_checked" }]
+options = [
+    { label = "10 seconds", value = 1 },
+    { label = "30 seconds", value = 3 },
+    { label = "1 minute", value = 6 },
+    { label = "2 minutes", value = 12 },
+    { label = "3 minutes", value = 18 },
+    { label = "5 minutes", value = 30 },
+    { label = "10 minutes", value = 60 },
+    { label = "30 minutes", value = 180 },
+]
+
+[[field]]
+id = "angle_enabled"
+kind = "toggle"
+label = "Angle tuning"
+page = "Advanced Sensor"
+optional = true
+at = { offset = 191, codec = "scyrox_checked" }
+
+[[field]]
+id = "angle"
+kind = "range"
+label = "Angle"
+page = "Advanced Sensor"
+unit = "degrees"
+requires = "angle_enabled"
+optional = true
+min = -30
+max = 30
+at = { offset = 189, codec = "scyrox_checked_i8" }
+
+[[field]]
+id = "debounce"
+kind = "range"
+label = "Debounce"
+page = "Buttons"
+help = "Applies to all buttons."
+unit = "ms"
+slider = true
+min = 0
+max = 30
+at = { offset = 169, codec = "scyrox_checked" }
+
+[[field]]
+id = "buttons"
+kind = "buttons"
+label = "Buttons"
+page = "Button Mapping"
+names = ["Left button", "Right button", "Middle button", "Back button", "Forward button", "DPI button"]
+at = { offset = 96, stride = 4, codec = "scyrox_button" }
+extra = { offset = 256, stride = 32 }
+actions = ["left", "right", "middle", "back", "forward", "dpi_cycle", "rate_cycle", "disabled", "key", "media"]
+left_click = true

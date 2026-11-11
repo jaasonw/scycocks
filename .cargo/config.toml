@@ -1,0 +1,4 @@
+# Static C runtime so the exe runs without the Visual C++ Redistributable; wxdragon-sys
+# builds wxWidgets with the matching /MT runtime when this is set.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

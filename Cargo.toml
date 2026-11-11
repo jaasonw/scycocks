@@ -3,7 +3,7 @@ name = "scycocks"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Offline Scyrox mouse configurator"
+description = "Offline configurator for gaming mice"
 
 [features]
 default = ["gui"]
@@ -11,6 +11,8 @@ gui = ["dep:wxdragon"]
 
 [dependencies]
 hidapi = "2.6.7"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = { version = "1.2.1", default-features = false, features = ["parse", "serde", "std"] }
 wxdragon = { version = "0.9.24", default-features = false, optional = true }
 
 [profile.release]

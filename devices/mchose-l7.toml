@@ -1,0 +1,227 @@
+# MCHOSE L7 Pro and L7 Ultra+, wired or through the 8K (0x1020) or 1K (0x1021) receiver.
+# Ported from open-mchose. Protocol notes: docs/protocol-mchose.md.
+name = "MCHOSE L7 Pro"
+family = "mchose"
+timeout_ms = 600
+# Settings of the active profile (command 0x67), after the command byte.
+size = 63
+# The firmware keeps this byte in step with the stage count.
+volatile = [50]
+
+[[match]]
+vid = [0x5253, 0x3837]
+pid = [0x00B0, 0x4016, 0x1020, 0x1021]
+usage_page = 0xFF01
+
+# Receivers report the paired mouse's product string. An unknown one keeps the L7 Pro limits,
+# which every model accepts.
+[[variant]]
+when = { pid = 0x4016 }
+name = "MCHOSE L7 Ultra+"
+field = [
+    { id = "dpi", max = 42000 },
+    { id = "lod", options = [{ label = "0.7 mm", value = 0 }, { label = "1 mm", value = 1 }, { label = "2 mm", value = 2 }] },
+]
+
+[[variant]]
+when = { product = "MCHOSE L7 Ultra+" }
+name = "MCHOSE L7 Ultra+"
+field = [
+    { id = "dpi", max = 42000 },
+    { id = "lod", options = [{ label = "0.7 mm", value = 0 }, { label = "1 mm", value = 1 }, { label = "2 mm", value = 2 }] },
+]
+
+# Over 2.4G the receiver relays every command, and wired and wireless keep separate rates.
+[[variant]]
+when = { pid = [0x1020, 0x1021] }
+timeout_ms = 1500
+online = { frame = [0x11, 0x03], byte = 5, equals = 1, error = "The receiver is connected, but the mouse is off or asleep." }
+status = [
+    { label = "Firmware", frame = [0x11, 0x04], format = "{0:str}" },
+    { label = "Receiver", frame = [0x11, 0x04, 0xAA], format = "{0:str}" },
+    { label = "Battery", frame = [0x11, 0x06], format = "{9}%", charging = 10 },
+]
+field = [
+    { id = "rate", at = { offset = 2, mask = 0xF0 } },
+    { id = "dpi", active = [{ offset = 2, mask = 0x0F }, { offset = 1, mask = 0x0F }, { offset = 3 }] },
+]
+command = [{ id = "rate", frame = [0x11, 0x41, 0, "rate"] }]
+
+[[variant]]
+when = { pid = 0x1021 }
+field = [{ id = "rate", limit = 3 }]
+
+[online]
+frame = [0x11, 0x04]
+error = "The mouse does not respond."
+
+[read]
+frame = [0x12, 0x67]
+
+[[status]]
+label = "Firmware"
+frame = [0x11, 0x04]
+format = "{0:str}"
+
+[[status]]
+label = "Battery"
+frame = [0x11, 0x06]
+format = "{9}%"
+charging = 10
+
+[profiles]
+count = 3
+current = { offset = 0 }
+set = [0x11, 0x58, "profile"]
+
+[reset]
+frame = [0x11, 0x0B, 0xAA, 0x00]
+page = "Advanced"
+
+[[field]]
+id = "dpi"
+kind = "dpi"
+label = "DPI"
+page = "Basic"
+stages = 6
+min = 50
+max = 26000
+step = 50
+xy = true
+count = { offset = 16 }
+# Wired and wireless stage nibbles, then a mirror of the active stage.
+active = [{ offset = 1, mask = 0x0F }, { offset = 2, mask = 0x0F }, { offset = 3 }]
+x = { offset = 4, stride = 2, codec = "u16le" }
+y = { offset = 51, stride = 2, codec = "u16le" }
+
+[[field]]
+id = "rate"
+kind = "choice"
+label = "Polling rate"
+page = "Basic"
+at = { offset = 1, mask = 0xF0 }
+options = [
+    { label = "125 Hz", value = 0 },
+    { label = "500 Hz", value = 1 },
+    { label = "1000 Hz", value = 2 },
+    { label = "2000 Hz", value = 3 },
+    { label = "4000 Hz", value = 4 },
+    { label = "8000 Hz", value = 5 },
+]
+
+[[field]]
+id = "lod"
+kind = "choice"
+label = "Lift-off distance"
+page = "Basic"
+at = { offset = 17, mask = 0x03 }
+options = [{ label = "1 mm", value = 1 }, { label = "2 mm", value = 2 }]
+
+[[field]]
+id = "angle_snap"
+kind = "toggle"
+label = "Angle snapping"
+page = "Basic"
+at = { offset = 17, mask = 0x08 }
+
+[[field]]
+id = "ripple"
+kind = "toggle"
+label = "Ripple control"
+page = "Basic"
+at = { offset = 17, mask = 0x04 }
+
+[[field]]
+id = "motion_sync"
+kind = "toggle"
+label = "Motion Sync"
+page = "Advanced"
+at = { offset = 17, mask = 0x10 }
+
+[[field]]
+id = "mode"
+kind = "choice"
+label = "Performance mode"
+page = "Advanced"
+at = { offset = 17, mask = 0xC0 }
+options = [
+    { label = "Performance", value = 0, send = 1 },
+    { label = "Gaming", value = 2, send = 2 },
+    { label = "Extreme", value = 3, send = 3 },
+]
+
+[[field]]
+id = "angle"
+kind = "range"
+label = "Sensor angle"
+page = "Advanced"
+unit = "degrees"
+min = -30
+max = 30
+at = { offset = 49, codec = "i8" }
+
+[[field]]
+id = "debounce"
+kind = "range"
+label = "Debounce"
+page = "Advanced"
+unit = "ms"
+slider = true
+min = 0
+max = 20
+at = { offset = 18 }
+
+[[field]]
+id = "sleep"
+kind = "range"
+label = "Sleep timer"
+page = "Advanced"
+help = "Minutes before the wireless mouse sleeps; 0 never sleeps."
+unit = "min"
+min = 0
+max = 100
+at = { offset = 19 }
+
+[[field]]
+id = "buttons"
+kind = "buttons"
+label = "Buttons"
+page = "Button Mapping"
+names = ["Left button", "Middle button", "Right button", "Forward button", "Back button"]
+at = { offset = 20, stride = 4, codec = "mchose_button" }
+actions = [
+    "default", "left", "right", "middle", "back", "forward", "wheel_up", "wheel_down",
+    "dpi_cycle", "dpi_up", "dpi_down", "profile", "profile_cycle", "disabled", "key", "media",
+]
+left_click = true
+
+[[command]]
+id = "dpi"
+fields = ["dpi"]
+frame = [0x12, 0x40, "dpi.active", "dpi.active", "dpi.active", "dpi.x*", "dpi.count", 0xFF, "dpi.y*"]
+
+[[command]]
+id = "rate"
+fields = ["rate"]
+frame = [0x11, 0x41, "rate", 0]
+
+[[command]]
+id = "sensor"
+fields = ["lod", "ripple", "angle_snap", "motion_sync", "mode", "angle"]
+frame = [0x11, 0x42, "lod", "ripple:flag12", "angle_snap:flag12", "motion_sync:flag12", 0, 0, "mode:send", 1, "angle"]
+
+[[command]]
+id = "debounce"
+fields = ["debounce"]
+frame = [0x11, 0x43, "debounce"]
+
+[[command]]
+id = "sleep"
+fields = ["sleep"]
+frame = [0x11, 0x0A, "sleep:nonzero", "sleep"]
+
+[[command]]
+id = "button"
+fields = ["buttons"]
+per_button = true
+frame = [0x12, 0x52, "index", 0, "span[0]:lo4", "span[1]", "span[2]", "span[3]"]

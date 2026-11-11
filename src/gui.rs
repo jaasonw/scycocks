@@ -1,69 +1,276 @@
-use crate::{
-    device::{self, Mouse},
-    settings::{self, Settings},
+//! Native wxWidgets front end. The form is generated from the connected device's definition.
+
+use crate::action::{self, Action};
+use crate::driver::{
+    self, Device, Dpi, Entry, Snapshot, Value,
+    def::{Def, Kind},
 };
 use std::{
     cell::{Cell, RefCell},
+    ffi::CString,
     rc::Rc,
-    sync::mpsc,
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 use wxdragon::prelude::*;
 
-const RATES: [u16; 7] = [125, 250, 500, 1000, 2000, 4000, 8000];
-const SLEEP_TIMES: [u8; 8] = [1, 3, 6, 12, 18, 30, 60, 180];
-const BUTTON_NAMES: [&str; 6] = [
-    "Left button",
-    "Right button",
-    "Middle button",
-    "Back button",
-    "Forward button",
-    "DPI button",
-];
 const WRAP_WIDTH: i32 = 560;
+const RETRY: Duration = Duration::from_secs(2);
+
+enum Command {
+    Connect(Option<CString>),
+    Apply(Vec<Value>),
+    Profile(u8),
+    Pair,
+    Reset,
+}
+
+enum Event {
+    /// Detected devices and the index being used.
+    Devices(Vec<(CString, String)>, Option<usize>),
+    Notice(String),
+    Done {
+        /// The resolved definition whenever a device opened, even if reading it failed.
+        def: Option<Arc<Def>>,
+        result: Result<Snapshot, String>,
+        message: String,
+        connection_attempt: bool,
+    },
+}
+
+fn open(
+    entries: &[Entry],
+    selected: &mut Option<CString>,
+    events: &mpsc::Sender<Event>,
+) -> Result<Device, String> {
+    let candidates = driver::discover(entries)?;
+    let index = candidates
+        .iter()
+        .position(|c| selected.as_ref() == Some(&c.path))
+        .or((!candidates.is_empty()).then_some(0));
+    let list = candidates
+        .iter()
+        .map(|c| (c.path.clone(), c.label.clone()))
+        .collect();
+    let _ = events.send(Event::Devices(list, index));
+    let candidate = &candidates
+        [index.ok_or("No supported mouse found. Connect one; retrying automatically.")?];
+    *selected = Some(candidate.path.clone());
+    Device::open(entries, candidate)
+}
+
+fn worker(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
+    let (entries, problems) = driver::load();
+    if !problems.is_empty() {
+        let _ = events.send(Event::Notice(format!(
+            "Skipped device files: {}",
+            problems.join("; ")
+        )));
+    }
+    let mut selected = None;
+    let mut session: Option<(Device, Snapshot)> = None;
+    let mut pairing: Option<(Device, Instant)> = None;
+    let done = |def: Option<Arc<Def>>, result, message: &str, connection_attempt| {
+        events
+            .send(Event::Done {
+                def,
+                result,
+                message: message.into(),
+                connection_attempt,
+            })
+            .is_ok()
+    };
+    loop {
+        let command = match commands.recv_timeout(Duration::from_secs(1)) {
+            Ok(command) => command,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some((device, deadline)) = &pairing {
+                    let result = match device.poll_pair() {
+                        Ok(true) => device.snapshot().map(Some),
+                        Ok(false) if Instant::now() < *deadline => Ok(None),
+                        Ok(false) => Err(
+                            "Pairing timed out. Repeat the mouse pairing gesture and try again."
+                                .into(),
+                        ),
+                        Err(error) => Err(error),
+                    };
+                    if !matches!(result, Ok(None)) {
+                        let (device, _) = pairing.take().expect("pairing is active");
+                        let result = result.map(|s| s.expect("completed pairing has a snapshot"));
+                        let def = Some(device.def().clone());
+                        if let Ok(snapshot) = &result {
+                            session = Some((device, snapshot.clone()));
+                        }
+                        if !done(def, result, "Receiver paired. Settings read.", false) {
+                            break;
+                        }
+                    }
+                } else if let Some((device, _)) = &session
+                    && let Err(error) = device.online()
+                {
+                    session = None;
+                    if !done(None, Err(error), "", true) {
+                        break;
+                    }
+                }
+                continue;
+            }
+        };
+        pairing = None;
+        let sent = match command {
+            Command::Connect(path) => {
+                session = None;
+                if path.is_some() {
+                    selected = path;
+                }
+                match open(&entries, &mut selected, &events) {
+                    Ok(device) => {
+                        let def = Some(device.def().clone());
+                        let result = device.snapshot();
+                        if let Ok(snapshot) = &result {
+                            session = Some((device, snapshot.clone()));
+                        }
+                        done(
+                            def,
+                            result,
+                            "Settings read. Changes are saved only when you select Apply.",
+                            true,
+                        )
+                    }
+                    Err(error) => done(None, Err(error), "", true),
+                }
+            }
+            Command::Pair => {
+                // Pairing works while the mouse is offline, so it opens the receiver directly.
+                let device = match session.take() {
+                    Some((device, _)) => Ok(device),
+                    None => open(&entries, &mut selected, &events),
+                };
+                match device.and_then(|d| d.start_pair().map(|()| d)) {
+                    Ok(device) => {
+                        let seconds = device.def().pair.as_ref().map_or(20, |p| p.timeout_s);
+                        pairing = Some((device, Instant::now() + Duration::from_secs(seconds)));
+                        true
+                    }
+                    Err(error) => done(None, Err(error), "", false),
+                }
+            }
+            command => {
+                let Some((device, snapshot)) = &session else {
+                    if !done(None, Err("Connect the mouse first.".into()), "", false) {
+                        break;
+                    }
+                    continue;
+                };
+                let (result, message) = match command {
+                    Command::Apply(values) if values == snapshot.values => (
+                        Ok(snapshot.clone()),
+                        "No settings changed. Nothing was written.",
+                    ),
+                    Command::Apply(values) => (
+                        device.apply(snapshot, &values),
+                        "Saved and verified the changed settings.",
+                    ),
+                    Command::Profile(p) => (
+                        device.set_profile(p),
+                        "Profile loaded. Pending edits were discarded.",
+                    ),
+                    _ => (
+                        device.factory_reset(),
+                        "Factory settings restored and read from the mouse.",
+                    ),
+                };
+                match &result {
+                    Ok(fresh) => {
+                        session =
+                            Some((session.take().expect("session is active").0, fresh.clone()))
+                    }
+                    Err(_) => session = None,
+                }
+                done(None, result, message, false)
+            }
+        };
+        if !sent {
+            break;
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
-struct Ui {
+struct Shell {
+    frame: Frame,
     root: Panel,
-    basic: Panel,
-    mapping: Panel,
+    content: Panel,
+    picker: Choice,
     info: StaticText,
     connect: Button,
     status: StaticText,
     apply: Button,
-    profile: Choice,
-    load_profile: Button,
-    rate: Choice,
-    max_rate: StaticText,
-    lod: Choice,
-    active_stage: SpinCtrl,
-    stages: SpinCtrl,
-    dpi: [(StaticText, Slider, SpinCtrlDouble); 8],
-    motion_sync: CheckBox,
-    angle_snap: CheckBox,
-    ripple: CheckBox,
-    competitive: CheckBox,
-    scanning: CheckBox,
-    sleep: Choice,
-    angle_enabled: CheckBox,
-    angle: SpinCtrl,
-    debounce_slider: Slider,
-    debounce: SpinCtrl,
-    pair: Button,
-    reset: Button,
-    buttons: [(Choice, TextCtrl); 6],
+}
+
+#[derive(Clone, Copy)]
+struct DpiRow {
+    caption: StaticText,
+    slider: Slider,
+    x: SpinCtrlDouble,
+    y: Option<(StaticText, SpinCtrlDouble)>,
+}
+
+enum Item {
+    Fixed(Action),
+    Key,
+    Media,
+    /// The binding the mouse already holds, used for encodings this tool does not decode.
+    Keep,
+}
+
+enum Control {
+    Toggle(CheckBox),
+    Choice(Choice, Vec<i64>),
+    Range(SpinCtrl, Option<Slider>),
+    Dpi {
+        count: SpinCtrl,
+        active: SpinCtrl,
+        rows: Vec<DpiRow>,
+    },
+    Buttons(Vec<(Choice, TextCtrl)>, Vec<Item>),
+}
+
+struct Form {
+    def: Arc<Def>,
+    notebook: Notebook,
+    pages: Vec<Panel>,
+    controls: Vec<Control>,
+    profile: Option<(Choice, Button)>,
+    reset: Option<Button>,
+    pair: Option<Button>,
+}
+
+impl Form {
+    fn checked(&self, id: &str) -> bool {
+        self.def
+            .field(id)
+            .is_some_and(|(i, _)| matches!(&self.controls[i], Control::Toggle(c) if c.is_checked()))
+    }
 }
 
 #[derive(Default)]
 struct State {
     connected: Cell<bool>,
     busy: Cell<bool>,
-    profiles_supported: Cell<bool>,
     reset_armed: Cell<bool>,
-    max_rate: Cell<u16>,
     details: RefCell<String>,
     connection_status: RefCell<String>,
-    current: RefCell<Option<Settings>>,
+    snapshot: RefCell<Option<Snapshot>>,
+    devices: RefCell<Vec<CString>>,
+    form: RefCell<Option<Form>>,
+}
+
+struct App {
+    shell: Shell,
+    state: State,
+    commands: mpsc::Sender<Command>,
 }
 
 fn text(parent: &impl WxWidget, label: &str) -> StaticText {
@@ -86,7 +293,7 @@ fn choice(parent: &impl WxWidget, items: &[&str]) -> Choice {
 fn row(page: &BoxSizer, parent: &Panel, caption: &str) -> (BoxSizer, StaticText) {
     let row = BoxSizer::builder(Orientation::Horizontal).build();
     let caption = text(parent, caption);
-    caption.set_min_size(Size::new(110, -1));
+    caption.set_min_size(Size::new(120, -1));
     row.add(&caption, 0, SizerFlag::AlignCenterVertical, 0);
     page.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 6);
     (row, caption)
@@ -107,466 +314,605 @@ fn note(page: &BoxSizer, parent: &Panel, label: &str) {
     page.add(&note, 0, SizerFlag::All, 6);
 }
 
-fn set_status(ui: &Ui, message: &str) {
-    ui.status.set_label(message);
-    ui.status.wrap(WRAP_WIDTH);
+fn dpi_spin(parent: &Panel, min: f64, max: f64, step: f64) -> SpinCtrlDouble {
+    let spin = SpinCtrlDouble::builder(parent)
+        .with_range(min, max)
+        .with_increment(step)
+        .with_initial_value(800.0_f64.clamp(min, max))
+        .build();
+    spin.set_digits(0);
+    spin
 }
 
-fn sync(ui: &Ui, state: &State) {
-    let connected = state.connected.get();
-    let busy = state.busy.get();
-    let edit = connected && !busy;
-    let info = if connected {
-        state.details.borrow().clone()
-    } else if busy {
-        "Reading mouse settings…".into()
-    } else {
-        state.connection_status.borrow().clone()
-    };
-    ui.info.set_label(&info);
-    ui.info.wrap(WRAP_WIDTH);
-    ui.connect.set_label(if connected {
-        "Reconnect"
-    } else {
-        "Connect mouse"
-    });
-    ui.connect.enable(!busy);
-    ui.apply.set_label(if busy { "Working…" } else { "APPLY" });
-    ui.apply.enable(edit);
-    let profiles = edit && state.profiles_supported.get();
-    ui.profile.enable(profiles);
-    ui.load_profile.enable(profiles);
-    ui.max_rate.set_label(&match state.max_rate.get() {
-        0 => String::new(),
-        rate => format!("Maximum: {rate} Hz"),
-    });
-    for choice in [ui.rate, ui.lod, ui.sleep] {
-        choice.enable(edit);
-    }
-    for check in [
-        ui.motion_sync,
-        ui.angle_snap,
-        ui.ripple,
-        ui.competitive,
-        ui.angle_enabled,
-    ] {
-        check.enable(edit);
-    }
-    ui.scanning.enable(edit && ui.competitive.is_checked());
-    ui.angle.enable(edit && ui.angle_enabled.is_checked());
-    for spin in [ui.active_stage, ui.stages, ui.debounce] {
-        spin.enable(edit);
-    }
-    ui.debounce_slider.enable(edit);
-    let stages = usize::try_from(ui.stages.value()).unwrap_or(1);
-    for (index, (caption, slider, spin)) in ui.dpi.iter().enumerate() {
-        let shown = index < stages;
-        caption.show(shown);
-        slider.show(shown);
-        spin.show(shown);
-        slider.enable(edit);
-        spin.enable(edit);
-    }
-    ui.pair.enable(!busy);
-    ui.reset.enable(edit);
-    ui.reset.set_label(if state.reset_armed.get() {
-        "Click again to reset"
-    } else {
-        "Factory reset"
-    });
-    for (action, shortcut) in ui.buttons {
-        action.enable(edit);
-        shortcut.enable(edit);
-        shortcut.show(matches!(action.get_selection(), Some(9 | 10)));
-    }
-    ui.basic.layout();
-    ui.mapping.layout();
-    ui.root.layout();
-}
-
-fn send(ui: &Ui, state: &State, commands: &mpsc::Sender<Command>, command: Command, message: &str) {
-    state.busy.set(true);
-    set_status(ui, message);
-    if commands.send(command).is_err() {
-        state.busy.set(false);
-        state.connected.set(false);
-        set_status(ui, "The HID worker stopped. Restart the app.");
-    }
-    sync(ui, state);
-}
-
-fn set_dpi(row: &(StaticText, Slider, SpinCtrlDouble), dpi: u16) {
-    row.1.set_value(i32::from(dpi / 50));
-    row.2.set_value(f64::from(dpi));
-}
-
-fn desired(ui: &Ui, mut desired: Settings, max_rate: u16) -> Result<Settings, String> {
-    desired.rate = *ui
-        .rate
-        .get_selection()
-        .and_then(|index| RATES.get(index as usize))
-        .ok_or("Select a valid polling rate.")?;
-    desired.stages = u8::try_from(ui.stages.value()).map_err(|_| "Invalid DPI stage count.")?;
-    desired.competitive = ui.competitive.is_checked();
-    desired.scanning_20k = ui.scanning.is_checked();
-    desired.sleep = *ui
-        .sleep
-        .get_selection()
-        .and_then(|index| SLEEP_TIMES.get(index as usize))
-        .ok_or("Select a sleep time.")?;
-    desired.angle = i8::try_from(ui.angle.value()).map_err(|_| "Invalid angle.")?;
-    desired.angle_enabled = ui.angle_enabled.is_checked();
-    desired.current =
-        u8::try_from(ui.active_stage.value() - 1).map_err(|_| "Select a valid DPI stage.")?;
-    desired.debounce = u8::try_from(ui.debounce.value()).map_err(|_| "Invalid debounce value.")?;
-    desired.lod = match ui.lod.get_selection() {
-        Some(0) => 3,
-        Some(index @ 1..=2) => index as u8,
-        _ => return Err("Invalid lift-off distance.".into()),
-    };
-    desired.motion_sync = ui.motion_sync.is_checked();
-    desired.angle_snap = ui.angle_snap.is_checked();
-    desired.ripple = ui.ripple.is_checked();
-    for (dpi, row) in desired
-        .dpi
-        .iter_mut()
-        .zip(&ui.dpi)
-        .take(usize::from(desired.stages))
-    {
-        let value = row.2.get_value().round();
-        if !(0.0..=f64::from(u16::MAX)).contains(&value) {
-            return Err("Invalid DPI value.".into());
+impl App {
+    fn send(&self, command: Command, message: &str) {
+        self.state.busy.set(true);
+        self.set_status(message);
+        if self.commands.send(command).is_err() {
+            self.state.busy.set(false);
+            self.state.connected.set(false);
+            self.set_status("The HID worker stopped. Restart the app.");
         }
-        *dpi = value as u16;
+        self.sync();
     }
-    for (i, (action, shortcut)) in ui.buttons.iter().enumerate() {
-        let action = action.get_selection().ok_or("Missing button action.")?;
-        if action == 8 {
-            continue;
-        }
-        if matches!(action, 9 | 10) {
-            let encoded = crate::bindings::encode(&shortcut.get_value(), action == 10)?;
-            if crate::bindings::decode(&desired.shortcuts[i]) != crate::bindings::decode(&encoded)
-                || desired.buttons[i] != [5, 0, 0]
-            {
-                desired.shortcuts[i] = encoded;
+
+    fn set_status(&self, message: &str) {
+        self.shell.status.set_label(message);
+        self.shell.status.wrap(WRAP_WIDTH);
+    }
+
+    fn sync(&self) {
+        let state = &self.state;
+        let (connected, busy) = (state.connected.get(), state.busy.get());
+        let edit = connected && !busy;
+        let info = if connected {
+            state.details.borrow().clone()
+        } else if busy {
+            "Reading mouse settings…".into()
+        } else {
+            state.connection_status.borrow().clone()
+        };
+        let shell = &self.shell;
+        shell.info.set_label(&info);
+        shell.info.wrap(WRAP_WIDTH);
+        shell.connect.set_label(if connected {
+            "Reconnect"
+        } else {
+            "Connect mouse"
+        });
+        shell.connect.enable(!busy);
+        shell.picker.enable(!busy);
+        shell
+            .apply
+            .set_label(if busy { "Working…" } else { "APPLY" });
+        shell.apply.enable(edit);
+        if let Some(form) = state.form.borrow().as_ref() {
+            for (field, control) in form.def.field.iter().zip(&form.controls) {
+                let on = edit
+                    && field
+                        .requires
+                        .as_ref()
+                        .is_none_or(|parent| form.checked(parent));
+                match control {
+                    Control::Toggle(check) => check.enable(on),
+                    Control::Choice(choice, _) => choice.enable(on),
+                    Control::Range(spin, slider) => {
+                        spin.enable(on);
+                        if let Some(slider) = slider {
+                            slider.enable(on);
+                        }
+                    }
+                    Control::Dpi {
+                        count,
+                        active,
+                        rows,
+                    } => {
+                        count.enable(on);
+                        active.enable(on);
+                        let stages = usize::try_from(count.value()).unwrap_or(1);
+                        active.set_range(1, count.value().max(1));
+                        for (index, row) in rows.iter().enumerate() {
+                            let shown = index < stages;
+                            row.caption.show(shown);
+                            row.slider.show(shown);
+                            row.slider.enable(on);
+                            if let Some((label, _)) = row.y {
+                                label.show(shown);
+                            }
+                            for spin in std::iter::once(row.x).chain(row.y.map(|(_, y)| y)) {
+                                spin.show(shown);
+                                spin.enable(on);
+                            }
+                        }
+                    }
+                    Control::Buttons(rows, items) => {
+                        for (action, shortcut) in rows {
+                            action.enable(on);
+                            shortcut.enable(on);
+                            let selected =
+                                action.get_selection().and_then(|i| items.get(i as usize));
+                            shortcut.show(matches!(selected, Some(Item::Key | Item::Media)));
+                        }
+                    }
+                }
             }
-            desired.buttons[i] = [5, 0, 0];
-            continue;
-        }
-        desired.buttons[i] = *settings::BUTTON_ACTIONS
-            .get(action as usize)
-            .ok_or("Invalid button action.")?;
-    }
-    desired.validate(max_rate)?;
-    Ok(desired)
-}
-
-fn show_settings(ui: &Ui, state: &State, snapshot: Snapshot) {
-    let settings = &snapshot.settings;
-    state.connected.set(true);
-    state.reset_armed.set(false);
-    *state.details.borrow_mut() = snapshot.details;
-    state.max_rate.set(snapshot.max_rate);
-    state.profiles_supported.set(snapshot.profile.is_some());
-    ui.profile
-        .set_selection(u32::from(snapshot.profile.unwrap_or(0)));
-    ui.rate.set_selection(
-        RATES
-            .iter()
-            .position(|rate| *rate == settings.rate)
-            .unwrap_or(3) as u32,
-    );
-    ui.lod.set_selection(if settings.lod == 3 {
-        0
-    } else {
-        u32::from(settings.lod)
-    });
-    ui.stages.set_value(i32::from(settings.stages));
-    ui.active_stage
-        .set_range(1, i32::from(settings.stages).max(1));
-    ui.active_stage.set_value(i32::from(settings.current) + 1);
-    for (row, dpi) in ui
-        .dpi
-        .iter()
-        .zip(&settings.dpi[..usize::from(settings.stages)])
-    {
-        set_dpi(row, *dpi);
-    }
-    ui.motion_sync.set_value(settings.motion_sync);
-    ui.angle_snap.set_value(settings.angle_snap);
-    ui.ripple.set_value(settings.ripple);
-    ui.competitive.set_value(settings.competitive);
-    ui.scanning.set_value(settings.scanning_20k);
-    ui.sleep.set_selection(
-        SLEEP_TIMES
-            .iter()
-            .position(|value| *value == settings.sleep)
-            .unwrap_or(5) as u32,
-    );
-    ui.angle_enabled.set_value(settings.angle_enabled);
-    ui.angle.set_value(i32::from(settings.angle));
-    ui.debounce.set_value(i32::from(settings.debounce));
-    ui.debounce_slider.set_value(i32::from(settings.debounce));
-    for (index, (action, shortcut)) in ui.buttons.iter().enumerate() {
-        let decoded = crate::bindings::decode(&settings.shortcuts[index]);
-        let selection = match decoded {
-            Some((media, _)) if settings.buttons[index] == [5, 0, 0] => {
-                if media {
-                    10
+            let profiles = edit
+                && state
+                    .snapshot
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|s| s.profile.is_some());
+            if let Some((choice, load)) = form.profile {
+                choice.enable(profiles);
+                load.enable(profiles);
+            }
+            if let Some(reset) = form.reset {
+                reset.enable(edit);
+                reset.set_label(if state.reset_armed.get() {
+                    "Click again to reset"
                 } else {
-                    9
-                }
+                    "Factory reset"
+                });
             }
-            _ => settings::BUTTON_ACTIONS
-                .iter()
-                .position(|action| *action == settings.buttons[index])
-                .unwrap_or(8),
-        };
-        action.set_selection(selection as u32);
-        shortcut.set_value(&decoded.map(|(_, text)| text).unwrap_or_default());
-    }
-    *state.current.borrow_mut() = Some(snapshot.settings);
-}
-
-#[derive(Clone)]
-struct Snapshot {
-    settings: Settings,
-    raw: [u8; 256],
-    label: String,
-    details: String,
-    max_rate: u16,
-    profile: Option<u8>,
-}
-
-enum Command {
-    Connect,
-    Apply(Box<Settings>),
-    Profile(u8),
-    Pair,
-    Reset,
-}
-struct Event {
-    result: Result<Snapshot, String>,
-    message: String,
-    connection_attempt: bool,
-}
-
-fn snapshot(mouse: &Mouse, label: &str) -> Result<Snapshot, String> {
-    let profile = mouse.query(14).ok().map(|reply| reply[6]);
-    if profile.is_some_and(|p| p > 3) {
-        return Err("Unknown profile number.".into());
-    }
-    let raw = mouse.read_config()?;
-    let mut settings = Settings::decode(&raw)?;
-    for index in 0..6 {
-        if settings.buttons[index][0] == 5 {
-            settings.shortcuts[index] = mouse.read_shortcut(index)?;
+            if let Some(pair) = form.pair {
+                pair.enable(!busy && form.def.pair.as_ref().is_some_and(|p| p.enabled));
+            }
+            for page in &form.pages {
+                page.layout();
+            }
         }
+        shell.root.layout();
     }
-    if let Some(profile) = profile
-        && mouse.query(14)?[6] != profile
-    {
-        return Err("The active profile changed during the read. Reconnect.".into());
-    }
-    let version = mouse.query(18)?;
-    let battery = mouse.query(4)?;
-    Ok(Snapshot {
-        settings,
-        raw,
-        label: label.into(),
-        max_rate: mouse.max_rate(),
-        profile,
-        details: format!(
-            "Firmware v{}.{:02x} · Battery {}%{} · Maximum {} Hz",
-            version[6],
-            version[7],
-            battery[6],
-            if battery[7] == 1 { " (charging)" } else { "" },
-            mouse.max_rate()
-        ),
-    })
-}
 
-fn worker(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
-    let mut connected: Option<(Mouse, Snapshot)> = None;
-    let mut pairing: Option<(Mouse, String, std::time::Instant)> = None;
-    loop {
-        let command = match commands.recv_timeout(Duration::from_secs(1)) {
-            Ok(command) => command,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Some((mouse, label, deadline)) = pairing.as_ref() {
-                    let result = (|| {
-                        let status = mouse.query(6)?[6];
-                        if status == 3 {
-                            return snapshot(mouse, label).map(Some);
-                        }
-                        if status == 2 || std::time::Instant::now() >= *deadline {
-                            return Err("Pairing failed or timed out. Repeat the mouse pairing gesture and try again.".into());
-                        }
-                        Ok(None)
-                    })();
-                    match result {
-                        Ok(None) => continue,
-                        result => {
-                            let (mouse, _, _) = pairing.take().expect("Pairing is active");
-                            let result = result
-                                .map(|state| state.expect("Completed pairing has a snapshot"));
-                            if let Ok(state) = &result {
-                                connected = Some((mouse, state.clone()));
-                            }
-                            if events
-                                .send(Event {
-                                    result,
-                                    message: "Receiver paired. Settings read.".into(),
-                                    connection_attempt: false,
-                                })
-                                .is_err()
-                            {
-                                break;
-                            }
-                            continue;
+    fn show_values(&self, snapshot: &Snapshot) {
+        let form = self.state.form.borrow();
+        let Some(form) = form.as_ref() else {
+            return;
+        };
+        if let (Some((choice, _)), Some(profile)) = (form.profile, snapshot.profile) {
+            choice.set_selection(u32::from(profile));
+        }
+        for (control, value) in form.controls.iter().zip(&snapshot.values) {
+            match (control, value) {
+                (Control::Toggle(check), Value::Bool(on)) => check.set_value(*on),
+                (Control::Choice(choice, values), Value::Int(v)) => {
+                    if let Some(index) = values.iter().position(|x| x == v) {
+                        choice.set_selection(index as u32);
+                    }
+                }
+                (Control::Range(spin, slider), Value::Int(v)) => {
+                    let v = i32::try_from(*v).unwrap_or_default();
+                    spin.set_value(v);
+                    if let Some(slider) = slider {
+                        slider.set_value(v);
+                    }
+                }
+                (
+                    Control::Dpi {
+                        count,
+                        active,
+                        rows,
+                    },
+                    Value::Dpi(dpi),
+                ) => {
+                    count.set_value(dpi.count as i32);
+                    active.set_range(1, dpi.count as i32);
+                    active.set_value(dpi.active as i32 + 1);
+                    for (row, &(x, y)) in rows.iter().zip(&dpi.stages) {
+                        if (x, y) != (0, 0) {
+                            set_dpi(row, x, y);
                         }
                     }
                 }
-                if let Some((mouse, _)) = connected.as_ref()
-                    && let Err(error) = mouse.check_online()
-                {
-                    connected = None;
-                    if events
-                        .send(Event {
-                            result: Err(error),
-                            message: String::new(),
-                            connection_attempt: true,
+                (Control::Buttons(rows, items), Value::Buttons(actions)) => {
+                    for ((choice, shortcut), action) in rows.iter().zip(actions) {
+                        let index = items.iter().position(|item| match item {
+                            Item::Fixed(fixed) => fixed == action,
+                            Item::Key => matches!(action, Action::Key { .. }),
+                            Item::Media => matches!(action, Action::Media(_)),
+                            Item::Keep => true,
+                        });
+                        choice.set_selection(index.unwrap_or(0) as u32);
+                        shortcut.set_value(&action::format_shortcut(action));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn read_values(&self) -> Result<Vec<Value>, String> {
+        let form = self.state.form.borrow();
+        let snapshot = self.state.snapshot.borrow();
+        let (Some(form), Some(snapshot)) = (form.as_ref(), snapshot.as_ref()) else {
+            return Err("Connect the mouse first.".into());
+        };
+        let mut values = Vec::new();
+        for ((field, control), old) in form
+            .def
+            .field
+            .iter()
+            .zip(&form.controls)
+            .zip(&snapshot.values)
+        {
+            values.push(match control {
+                Control::Toggle(check) => Value::Bool(check.is_checked()),
+                Control::Choice(choice, options) => Value::Int(
+                    *choice
+                        .get_selection()
+                        .and_then(|i| options.get(i as usize))
+                        .ok_or_else(|| format!("Select a {}.", field.label.to_lowercase()))?,
+                ),
+                Control::Range(spin, _) => Value::Int(i64::from(spin.value())),
+                Control::Dpi {
+                    count,
+                    active,
+                    rows,
+                } => {
+                    let Value::Dpi(old) = old else {
+                        return Err("Stale DPI settings.".into());
+                    };
+                    let count =
+                        usize::try_from(count.value()).map_err(|_| "Invalid DPI stage count.")?;
+                    let active = usize::try_from(active.value() - 1)
+                        .map_err(|_| "Select a valid DPI stage.")?;
+                    let value =
+                        |spin: SpinCtrlDouble| spin.get_value().round().clamp(0.0, 65535.0) as u16;
+                    let stages = rows
+                        .iter()
+                        .zip(&old.stages)
+                        .enumerate()
+                        .map(|(i, (row, kept))| {
+                            if i < count {
+                                let x = value(row.x);
+                                (x, row.y.map_or(x, |(_, y)| value(y)))
+                            } else {
+                                *kept
+                            }
                         })
-                        .is_err()
+                        .collect();
+                    Value::Dpi(Dpi {
+                        count,
+                        active,
+                        stages,
+                    })
+                }
+                Control::Buttons(rows, items) => {
+                    let Value::Buttons(old) = old else {
+                        return Err("Stale button settings.".into());
+                    };
+                    let mut actions = Vec::new();
+                    for (((choice, shortcut), kept), name) in rows.iter().zip(old).zip(&field.names)
                     {
-                        break;
+                        let item = choice.get_selection().and_then(|i| items.get(i as usize));
+                        actions.push(match item {
+                            Some(Item::Fixed(action)) => action.clone(),
+                            Some(Item::Key) => action::parse_shortcut(&shortcut.get_value(), false)
+                                .map_err(|e| format!("{name}: {e}"))?,
+                            Some(Item::Media) => {
+                                action::parse_shortcut(&shortcut.get_value(), true)
+                                    .map_err(|e| format!("{name}: {e}"))?
+                            }
+                            Some(Item::Keep) | None => kept.clone(),
+                        });
+                    }
+                    Value::Buttons(actions)
+                }
+            });
+        }
+        Ok(values)
+    }
+}
+
+fn set_dpi(row: &DpiRow, x: u16, y: u16) {
+    row.x.set_value(f64::from(x));
+    if let Some((_, spin)) = row.y {
+        spin.set_value(f64::from(y));
+    }
+    row.slider.set_value(i32::from(x));
+}
+
+fn build_form(app: &Rc<App>, def: Arc<Def>) -> Form {
+    let content = app.shell.content;
+    let notebook = Notebook::builder(&content).build();
+    let mut names: Vec<&str> = Vec::new();
+    let extra_pages = def
+        .reset
+        .iter()
+        .map(|r| r.page.as_str())
+        .chain(def.pair.iter().map(|p| p.page.as_str()));
+    for name in def.field.iter().map(|f| f.page.as_str()).chain(extra_pages) {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let pages: Vec<(Panel, BoxSizer)> = names
+        .iter()
+        .map(|_| {
+            (
+                Panel::builder(&notebook).build(),
+                BoxSizer::builder(Orientation::Vertical).build(),
+            )
+        })
+        .collect();
+    let page = |name: &str| pages[names.iter().position(|n| *n == name).unwrap_or(0)];
+
+    let profile = def.profiles.as_ref().map(|profiles| {
+        let (panel, sizer) = pages[0];
+        let (r, _) = row(&sizer, &panel, "Profile");
+        let labels: Vec<String> = (1..=profiles.count)
+            .map(|p| format!("Profile {p}"))
+            .collect();
+        let choice = Choice::builder(&panel).with_choices(labels).build();
+        let load = button(&panel, "Load profile");
+        put(&r, &choice);
+        put(&r, &load);
+        let app = app.clone();
+        load.on_click(move |_| {
+            let profile = choice.get_selection().unwrap_or(0) as u8;
+            app.send(
+                Command::Profile(profile),
+                "Loading profile; pending edits will be discarded…",
+            );
+        });
+        (choice, load)
+    });
+
+    let mut controls = Vec::new();
+    for field in &def.field {
+        let (panel, sizer) = page(&field.page);
+        let control = match field.kind {
+            Kind::Toggle => {
+                let check = CheckBox::builder(&panel).with_label(&field.label).build();
+                sizer.add(&check, 0, SizerFlag::All, 6);
+                let (app, id) = (app.clone(), field.id.clone());
+                check.on_toggled(move |_| {
+                    if let Some(form) = app.state.form.borrow().as_ref() {
+                        for (dependent, control) in form.def.field.iter().zip(&form.controls) {
+                            if let (Some(parent), Control::Toggle(child)) =
+                                (&dependent.requires, control)
+                                && *parent == id
+                                && !check.is_checked()
+                            {
+                                child.set_value(false);
+                            }
+                        }
+                    }
+                    app.sync();
+                });
+                Control::Toggle(check)
+            }
+            Kind::Choice => {
+                let (r, _) = row(&sizer, &panel, &field.label);
+                let offered =
+                    &field.options[..field.limit.unwrap_or(usize::MAX).min(field.options.len())];
+                let labels: Vec<&str> = offered.iter().map(|o| o.label.as_str()).collect();
+                let choice = choice(&panel, &labels);
+                put(&r, &choice);
+                Control::Choice(choice, offered.iter().map(|o| o.value).collect())
+            }
+            Kind::Range => {
+                let (r, _) = row(&sizer, &panel, &field.label);
+                let (min, max) = (field.min.unwrap_or(0) as i32, field.max.unwrap_or(0) as i32);
+                let spin = SpinCtrl::builder(&panel).with_range(min, max).build();
+                let slider = field.slider.then(|| {
+                    let slider = Slider::builder(&panel)
+                        .with_min_value(min)
+                        .with_max_value(max)
+                        .build();
+                    slider.set_min_size(Size::new(200, -1));
+                    r.add(
+                        &slider,
+                        1,
+                        SizerFlag::AlignCenterVertical | SizerFlag::Left,
+                        8,
+                    );
+                    slider.on_slider(move |_| spin.set_value(slider.value()));
+                    spin.on_value_changed(move |_| slider.set_value(spin.value()));
+                    slider
+                });
+                put(&r, &spin);
+                if let Some(unit) = &field.unit {
+                    put(&r, &text(&panel, unit));
+                }
+                Control::Range(spin, slider)
+            }
+            Kind::Dpi => {
+                let slots = field.stages.unwrap_or(1);
+                let (min, max) = (
+                    field.min.unwrap_or(50) as f64,
+                    field.max.unwrap_or(30000) as f64,
+                );
+                let step = field.step.unwrap_or(50).max(1) as f64;
+                let (r, _) = row(&sizer, &panel, "Active DPI stage");
+                let active = SpinCtrl::builder(&panel)
+                    .with_range(1, slots as i32)
+                    .build();
+                let count = SpinCtrl::builder(&panel)
+                    .with_range(1, slots as i32)
+                    .build();
+                put(&r, &active);
+                put(&r, &text(&panel, "Stages"));
+                put(&r, &count);
+                let rows: Vec<DpiRow> = (0..slots)
+                    .map(|index| {
+                        let (r, caption) =
+                            row(&sizer, &panel, &format!("{} {}", field.label, index + 1));
+                        let slider = Slider::builder(&panel)
+                            .with_min_value(min as i32)
+                            .with_max_value(max as i32)
+                            .with_value(800.0_f64.clamp(min, max) as i32)
+                            .build();
+                        slider.set_min_size(Size::new(200, -1));
+                        let x = dpi_spin(&panel, min, max, step);
+                        let y = field
+                            .xy
+                            .then(|| (text(&panel, "Y"), dpi_spin(&panel, min, max, step)));
+                        r.add(
+                            &slider,
+                            1,
+                            SizerFlag::AlignCenterVertical | SizerFlag::Left,
+                            8,
+                        );
+                        put(&r, &x);
+                        if let Some((label, y)) = y {
+                            put(&r, &label);
+                            put(&r, &y);
+                        }
+                        slider.on_slider(move |_| {
+                            let snapped =
+                                ((f64::from(slider.value()) / step).round() * step).clamp(min, max);
+                            x.set_value(snapped);
+                        });
+                        x.on_value_changed(move |_| slider.set_value(x.get_value().round() as i32));
+                        DpiRow {
+                            caption,
+                            slider,
+                            x,
+                            y,
+                        }
+                    })
+                    .collect();
+                let new_rows = rows.clone();
+                let app = app.clone();
+                count.on_value_changed(move |_| {
+                    let stages = usize::try_from(count.value()).unwrap_or(1);
+                    for row in new_rows.iter().take(stages).filter(|row| !row.x.is_shown()) {
+                        set_dpi(row, 800, 800);
+                    }
+                    app.sync();
+                });
+                Control::Dpi {
+                    count,
+                    active,
+                    rows,
+                }
+            }
+            Kind::Buttons => {
+                let profiles = def.profiles.as_ref().map_or(0, |p| p.count);
+                let mut items = Vec::new();
+                let mut labels = Vec::new();
+                for name in &field.actions {
+                    match name.as_str() {
+                        "key" => {
+                            items.push(Item::Key);
+                            labels.push("Keyboard shortcut".to_string());
+                        }
+                        "media" => {
+                            items.push(Item::Media);
+                            labels.push("Media key".to_string());
+                        }
+                        "profile" => {
+                            for p in 0..profiles {
+                                items.push(Item::Fixed(Action::Profile(Some(p))));
+                                labels.push(format!("Profile {}", p + 1));
+                            }
+                        }
+                        name => {
+                            if let Some((_, label, action)) =
+                                action::NAMED.iter().find(|(n, _, _)| *n == name)
+                            {
+                                items.push(Item::Fixed(action.clone()));
+                                labels.push((*label).to_string());
+                            }
+                        }
                     }
                 }
-                continue;
-            }
-        };
-        if matches!(command, Command::Pair) {
-            connected = None;
-            pairing = None;
-            let result = (|| {
-                let devices = device::enumerate()?;
-                if devices.len() != 1 {
-                    return Err("Connect exactly one Scyrox wireless receiver for pairing.".into());
-                }
-                let mouse = Mouse::open(&devices[0].path)?;
-                mouse.start_pair()?;
-                pairing = Some((
-                    mouse,
-                    devices[0].label.clone(),
-                    std::time::Instant::now() + Duration::from_secs(20),
-                ));
-                Ok(())
-            })();
-            if let Err(error) = result
-                && events
-                    .send(Event {
-                        result: Err(error),
-                        message: String::new(),
-                        connection_attempt: false,
+                items.push(Item::Keep);
+                labels.push("Keep existing action".into());
+                let rows = field
+                    .names
+                    .iter()
+                    .map(|name| {
+                        let (r, _) = row(&sizer, &panel, name);
+                        let choice = Choice::builder(&panel).with_choices(labels.clone()).build();
+                        let shortcut = TextCtrl::builder(&panel).build();
+                        shortcut.set_min_size(Size::new(180, -1));
+                        put(&r, &choice);
+                        put(&r, &shortcut);
+                        let app = app.clone();
+                        choice.on_selection_changed(move |_| app.sync());
+                        (choice, shortcut)
                     })
-                    .is_err()
-            {
-                break;
-            }
-            continue;
-        }
-        let mut message =
-            "Settings read. Changes are saved only when you select Apply.".to_string();
-        let connection_attempt = matches!(command, Command::Connect);
-        let result = (|| {
-            if connection_attempt {
-                connected = None;
-                let mut failures = Vec::new();
-                let devices = device::enumerate()?;
-                if devices.len() > 1 {
-                    return Err(
-                        "Multiple Scyrox interfaces found. Leave one mouse or receiver connected."
-                            .into(),
+                    .collect();
+                if field.actions.iter().any(|a| a == "key" || a == "media") {
+                    note(
+                        &sizer,
+                        &panel,
+                        "Keyboard: Ctrl/Shift/Alt/Win + one key, such as Ctrl+Shift+A. Media: VolumeUp, VolumeDown, Mute, PlayPause, Stop, NextTrack, PreviousTrack, BrowserBack, BrowserForward, BrowserHome, BrowserRefresh, Calculator.",
                     );
                 }
-                for info in devices {
-                    match Mouse::open(&info.path)
-                        .and_then(|mouse| snapshot(&mouse, &info.label).map(|state| (mouse, state)))
-                    {
-                        Ok(pair) => {
-                            connected = Some(pair);
-                            break;
-                        }
-                        Err(error) => failures.push(error),
-                    }
-                }
-                if connected.is_none() {
-                    return Err(if failures.is_empty() {
-                        "No Scyrox V8 found. Connect the mouse or receiver; retrying automatically."
-                            .into()
-                    } else {
-                        failures.join("\n")
-                    });
-                }
+                Control::Buttons(rows, items)
             }
-            let (mouse, state) = connected.as_mut().ok_or("Connect the mouse first.")?;
-            if matches!(command, Command::Connect) {
-                return Ok(state.clone());
-            }
-            if let Command::Apply(ref desired) = command {
-                let writes = desired.changes(&state.settings, mouse.max_rate())?;
-                if !writes.is_empty() {
-                    let fresh = snapshot(mouse, &state.label)?;
-                    settings::verify_snapshot(&state.raw, &fresh.raw)?;
-                    if fresh.profile != state.profile
-                        || fresh.settings.shortcuts != state.settings.shortcuts
-                    {
-                        return Err("The profile or button shortcuts changed outside this app. Reconnect before applying.".into());
-                    }
-                    for (address, bytes) in &writes {
-                        mouse.write_block(*address, bytes).map_err(|e| {
-                            format!(
-                                "{e} Some settings may already be saved. Reconnect before retrying."
-                            )
-                        })?;
-                    }
-                    message = format!("Saved and verified {} changed settings.", writes.len());
-                } else {
-                    message = "No settings changed. Nothing was written.".into();
-                }
-            }
-            if let Command::Profile(profile) = command {
-                if state.profile.is_none() {
-                    return Err("This firmware does not support profile switching.".into());
-                }
-                mouse.set_profile(profile)?;
-                message = "Profile loaded. Pending edits were discarded.".into();
-            }
-            if matches!(command, Command::Reset) {
-                mouse.factory_reset()?;
-                message = "Factory settings restored and read from the mouse.".into();
-            }
-            let next = snapshot(mouse, &state.label)?;
-            *state = next.clone();
-            Ok(next)
-        })();
-        if result.is_err() {
-            connected = None;
+        };
+        if let Some(help) = &field.help {
+            note(&sizer, &panel, help);
         }
-        if events
-            .send(Event {
-                result,
-                message,
-                connection_attempt,
-            })
-            .is_err()
-        {
-            break;
-        }
+        controls.push(control);
     }
+
+    let reset = def.reset.as_ref().map(|reset| {
+        let (panel, sizer) = page(&reset.page);
+        let button = button(&panel, "Click again to reset");
+        sizer.add(&button, 0, SizerFlag::All, 6);
+        note(
+            &sizer,
+            &panel,
+            "Factory reset clears stored settings and discards pending edits.",
+        );
+        let app = app.clone();
+        button.on_click(move |_| {
+            if app.state.reset_armed.replace(false) {
+                app.send(Command::Reset, "Restoring factory settings…");
+            } else {
+                app.state.reset_armed.set(true);
+                app.set_status("Factory reset clears stored settings. Click again to reset.");
+                app.sync();
+            }
+        });
+        button
+    });
+    let pair = def.pair.as_ref().map(|pair| {
+        let (panel, sizer) = page(&pair.page);
+        if let Some(help) = &pair.help {
+            note(&sizer, &panel, help);
+        }
+        let button = button(&panel, "Pair receiver");
+        sizer.add(&button, 0, SizerFlag::All, 6);
+        let app = app.clone();
+        let seconds = pair.timeout_s;
+        button.on_click(move |_| {
+            app.send(
+                Command::Pair,
+                &format!("Pairing receiver. Waiting up to {seconds} seconds…"),
+            );
+        });
+        button
+    });
+
+    for ((panel, sizer), name) in pages.iter().zip(&names) {
+        panel.set_sizer(*sizer, true);
+        notebook.add_page(panel, name, false, None);
+    }
+    notebook.set_selection(0);
+    {
+        let app = app.clone();
+        notebook.on_page_changed(move |_| {
+            app.state.reset_armed.set(false);
+            app.sync();
+        });
+    }
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&notebook, 1, SizerFlag::Expand, 0);
+    content.set_sizer(sizer, true);
+    Form {
+        def,
+        notebook,
+        pages: pages.iter().map(|(p, _)| *p).collect(),
+        controls,
+        profile,
+        reset,
+        pair,
+    }
+}
+
+fn rebuild(app: &Rc<App>, def: Arc<Def>) {
+    let old = app.state.form.borrow_mut().take();
+    if let Some(old) = old {
+        old.notebook.destroy();
+    }
+    let form = build_form(app, def);
+    *app.state.form.borrow_mut() = Some(form);
+    // Size while every optional row is visible so the window fits all DPI stages.
+    let frame = app.shell.frame;
+    app.shell.root.layout();
+    let best = frame.get_best_size();
+    frame.set_min_size(best);
+    let size = frame.get_size();
+    frame.set_size(Size::new(
+        size.width.max(best.width),
+        size.height.max(best.height),
+    ));
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -581,205 +927,44 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn build(commands: mpsc::Sender<Command>, events: mpsc::Receiver<Event>) {
     let frame = Frame::builder()
-        .with_title("Scycocks · Scyrox V8 Configuration Tool")
+        .with_title("Scycocks · Mouse Configuration Tool")
+        .with_size(Size::new(680, 760))
         .build();
     let root = Panel::builder(&frame).build();
     let main = BoxSizer::builder(Orientation::Vertical).build();
 
     let info_box =
         StaticBoxSizerBuilder::new_with_label(Orientation::Vertical, &root, "Info").build();
-    let info_parent = info_box.get_static_box().expect("Info box");
-    let info = text(&info_parent, "");
+    let parent = info_box.get_static_box().expect("Info box");
+    let picker_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let picker = Choice::builder(&parent).build();
+    picker.set_min_size(Size::new(360, -1));
+    picker_row.add(
+        &text(&parent, "Mouse"),
+        0,
+        SizerFlag::AlignCenterVertical | SizerFlag::Right,
+        8,
+    );
+    picker_row.add(&picker, 1, SizerFlag::AlignCenterVertical, 0);
+    let info = text(&parent, "");
     let version = text(
-        &info_parent,
+        &parent,
         &format!("Software version: {}", env!("CARGO_PKG_VERSION")),
     );
-    let connect = button(&info_parent, "Connect mouse");
+    let connect = button(&parent, "Connect mouse");
+    info_box.add_sizer(&picker_row, 0, SizerFlag::Expand | SizerFlag::All, 6);
     info_box.add(&info, 0, SizerFlag::Expand | SizerFlag::All, 6);
     info_box.add(&version, 0, SizerFlag::Left | SizerFlag::Right, 6);
     info_box.add(&connect, 0, SizerFlag::AlignRight | SizerFlag::All, 6);
     main.add_sizer(&info_box, 0, SizerFlag::Expand | SizerFlag::All, 10);
 
-    let tabs = Notebook::builder(&root).build();
+    let content = Panel::builder(&root).build();
     main.add(
-        &tabs,
+        &content,
         1,
         SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right,
         10,
     );
-
-    let basic = Panel::builder(&tabs).build();
-    let page = BoxSizer::builder(Orientation::Vertical).build();
-    let (r, _) = row(&page, &basic, "Profile");
-    let profile = choice(
-        &basic,
-        &["Profile 1", "Profile 2", "Profile 3", "Profile 4"],
-    );
-    let load_profile = button(&basic, "Load profile");
-    put(&r, &profile);
-    put(&r, &load_profile);
-    let (r, _) = row(&page, &basic, "Polling rate");
-    let rate = choice(
-        &basic,
-        &[
-            "125 Hz", "250 Hz", "500 Hz", "1000 Hz", "2000 Hz", "4000 Hz", "8000 Hz",
-        ],
-    );
-    let max_rate = text(&basic, "Maximum: 8000 Hz");
-    put(&r, &rate);
-    put(&r, &max_rate);
-    let (r, _) = row(&page, &basic, "Lift-off distance");
-    let lod = choice(&basic, &["0.7 mm", "1 mm", "2 mm"]);
-    put(&r, &lod);
-    let (r, _) = row(&page, &basic, "Active DPI stage");
-    let active_stage = SpinCtrl::builder(&basic).with_range(1, 8).build();
-    let stages = SpinCtrl::builder(&basic).with_range(1, 8).build();
-    put(&r, &active_stage);
-    put(&r, &text(&basic, "Stages"));
-    put(&r, &stages);
-    let dpi = std::array::from_fn(|index| {
-        let (r, caption) = row(&page, &basic, &format!("DPI {}", index + 1));
-        let slider = Slider::builder(&basic)
-            .with_min_value(1)
-            .with_max_value(600)
-            .with_value(16)
-            .build();
-        let spin = SpinCtrlDouble::builder(&basic)
-            .with_range(50.0, 30000.0)
-            .with_increment(50.0)
-            .with_initial_value(800.0)
-            .build();
-        spin.set_digits(0);
-        r.add(
-            &slider,
-            1,
-            SizerFlag::AlignCenterVertical | SizerFlag::Left,
-            8,
-        );
-        put(&r, &spin);
-        slider.on_slider(move |_| spin.set_value(f64::from(slider.value() * 50)));
-        spin.on_value_changed(move |_| slider.set_value((spin.get_value() / 50.0).round() as i32));
-        (caption, slider, spin)
-    });
-    basic.set_sizer(page, true);
-    tabs.add_page(&basic, "Basic", true, None);
-
-    let advanced = Panel::builder(&tabs).build();
-    let page = BoxSizer::builder(Orientation::Vertical).build();
-    let check = |label: &str| {
-        let check = CheckBox::builder(&advanced).with_label(label).build();
-        page.add(&check, 0, SizerFlag::All, 6);
-        check
-    };
-    let motion_sync = check("Motion Sync");
-    let angle_snap = check("Angle snapping");
-    let ripple = check("Ripple control");
-    let competitive = check("Competitive Mode");
-    let scanning = check("20K sensor scanning");
-    note(
-        &page,
-        &advanced,
-        "Competitive Mode and 20K scanning use more battery.",
-    );
-    let (r, _) = row(&page, &advanced, "Sleep time");
-    let sleep = choice(
-        &advanced,
-        &[
-            "10 seconds",
-            "30 seconds",
-            "1 minute",
-            "2 minutes",
-            "3 minutes",
-            "5 minutes",
-            "10 minutes",
-            "30 minutes",
-        ],
-    );
-    put(&r, &sleep);
-    let r = BoxSizer::builder(Orientation::Horizontal).build();
-    let angle_enabled = CheckBox::builder(&advanced)
-        .with_label("Angle tuning")
-        .build();
-    angle_enabled.set_min_size(Size::new(110, -1));
-    let angle = SpinCtrl::builder(&advanced).with_range(-30, 30).build();
-    r.add(&angle_enabled, 0, SizerFlag::AlignCenterVertical, 0);
-    put(&r, &angle);
-    put(&r, &text(&advanced, "degrees"));
-    page.add_sizer(&r, 0, SizerFlag::All, 6);
-    advanced.set_sizer(page, true);
-    tabs.add_page(&advanced, "Advanced Sensor", false, None);
-
-    let buttons_page = Panel::builder(&tabs).build();
-    let page = BoxSizer::builder(Orientation::Vertical).build();
-    let (r, _) = row(&page, &buttons_page, "Debounce (ms)");
-    let debounce_slider = Slider::builder(&buttons_page)
-        .with_min_value(0)
-        .with_max_value(30)
-        .build();
-    let debounce = SpinCtrl::builder(&buttons_page).with_range(0, 30).build();
-    r.add(
-        &debounce_slider,
-        1,
-        SizerFlag::AlignCenterVertical | SizerFlag::Left,
-        8,
-    );
-    put(&r, &debounce);
-    debounce_slider.on_slider(move |_| debounce.set_value(debounce_slider.value()));
-    debounce.on_value_changed(move |_| debounce_slider.set_value(debounce.value()));
-    note(&page, &buttons_page, "Applies to all buttons.");
-    note(
-        &page,
-        &buttons_page,
-        "Pairing: hold left, right and middle buttons for 3 seconds until the light flashes. Keep the mouse close to the receiver.",
-    );
-    let r = BoxSizer::builder(Orientation::Horizontal).build();
-    let pair = button(&buttons_page, "Pair receiver");
-    let reset = button(&buttons_page, "Click again to reset");
-    r.add(&pair, 0, SizerFlag::All, 0);
-    put(&r, &reset);
-    page.add_sizer(&r, 0, SizerFlag::All, 6);
-    note(
-        &page,
-        &buttons_page,
-        "Loading a profile or resetting discards pending edits.",
-    );
-    buttons_page.set_sizer(page, true);
-    tabs.add_page(&buttons_page, "Buttons", false, None);
-
-    let mapping = Panel::builder(&tabs).build();
-    let page = BoxSizer::builder(Orientation::Vertical).build();
-    let buttons = BUTTON_NAMES.map(|name| {
-        let (r, _) = row(&page, &mapping, name);
-        let action = choice(
-            &mapping,
-            &[
-                "Left click",
-                "Right click",
-                "Middle click",
-                "Back",
-                "Forward",
-                "Cycle DPI",
-                "Cycle polling rate",
-                "Disabled",
-                "Keep existing action",
-                "Keyboard shortcut",
-                "Media key",
-            ],
-        );
-        let shortcut = TextCtrl::builder(&mapping).build();
-        shortcut.set_min_size(Size::new(200, -1));
-        put(&r, &action);
-        put(&r, &shortcut);
-        (action, shortcut)
-    });
-    note(
-        &page,
-        &mapping,
-        "Keyboard: Ctrl/Shift/Alt/Win + one key, such as Ctrl+Shift+A. Media: VolumeUp, VolumeDown, Mute, PlayPause, Stop, NextTrack, PreviousTrack, BrowserBack, BrowserForward, BrowserHome, BrowserRefresh, Calculator.",
-    );
-    mapping.set_sizer(page, true);
-    tabs.add_page(&mapping, "Button Mapping", false, None);
-
     let status = text(&root, "Settings remain unchanged until you select Apply.");
     main.add(&status, 0, SizerFlag::Expand | SizerFlag::All, 10);
     let apply = button(&root, "Working…");
@@ -792,205 +977,125 @@ fn build(commands: mpsc::Sender<Command>, events: mpsc::Receiver<Event>) {
     root.set_sizer(main, true);
     let frame_sizer = BoxSizer::builder(Orientation::Vertical).build();
     frame_sizer.add(&root, 1, SizerFlag::Expand, 0);
-    // Fit while every optional row is visible so the minimum size covers 8 DPI stages.
-    frame.set_sizer_and_fit(frame_sizer, true);
+    frame.set_sizer(frame_sizer, true);
 
-    let ui = Ui {
-        root,
-        basic,
-        mapping,
-        info,
-        connect,
-        status,
-        apply,
-        profile,
-        load_profile,
-        rate,
-        max_rate,
-        lod,
-        active_stage,
-        stages,
-        dpi,
-        motion_sync,
-        angle_snap,
-        ripple,
-        competitive,
-        scanning,
-        sleep,
-        angle_enabled,
-        angle,
-        debounce_slider,
-        debounce,
-        pair,
-        reset,
-        buttons,
-    };
-    let state = Rc::new(State::default());
-    *state.connection_status.borrow_mut() = "Connect a Scyrox V8 or its receiver.".into();
-    for (choice, index) in [(profile, 0), (rate, 3), (lod, 1), (sleep, 5)] {
-        choice.set_selection(index);
-    }
-    for (action, _) in buttons {
-        action.set_selection(8);
-    }
+    let app = Rc::new(App {
+        shell: Shell {
+            frame,
+            root,
+            content,
+            picker,
+            info,
+            connect,
+            status,
+            apply,
+        },
+        state: State::default(),
+        commands,
+    });
+    *app.state.connection_status.borrow_mut() = "Connect a supported mouse.".into();
 
     {
-        let (state, commands) = (state.clone(), commands.clone());
-        connect.on_click(move |_| {
-            send(
-                &ui,
-                &state,
-                &commands,
-                Command::Connect,
-                "Reading mouse settings…",
-            );
-        });
+        let app = app.clone();
+        connect.on_click(move |_| app.send(Command::Connect(None), "Reading mouse settings…"));
     }
     {
-        let (state, commands) = (state.clone(), commands.clone());
-        apply.on_click(move |_| {
-            let Some(current) = state.current.borrow().clone() else {
-                return;
-            };
-            match desired(&ui, current, state.max_rate.get()) {
-                Ok(desired) => send(
-                    &ui,
-                    &state,
-                    &commands,
-                    Command::Apply(Box::new(desired)),
-                    "Saving changed settings and checking readback…",
-                ),
-                Err(error) => set_status(&ui, &error),
+        let app = app.clone();
+        picker.on_selection_changed(move |_| {
+            let path = picker
+                .get_selection()
+                .and_then(|i| app.state.devices.borrow().get(i as usize).cloned());
+            if path.is_some() {
+                app.send(Command::Connect(path), "Reading mouse settings…");
             }
         });
     }
     {
-        let (state, commands) = (state.clone(), commands.clone());
-        load_profile.on_click(move |_| {
-            let profile = ui.profile.get_selection().unwrap_or(0) as u8;
-            send(
-                &ui,
-                &state,
-                &commands,
-                Command::Profile(profile),
-                "Loading profile; pending edits will be discarded…",
-            );
+        let app = app.clone();
+        apply.on_click(move |_| match app.read_values() {
+            Ok(values) => app.send(
+                Command::Apply(values),
+                "Saving changed settings and checking readback…",
+            ),
+            Err(error) => app.set_status(&error),
         });
-    }
-    {
-        let (state, commands) = (state.clone(), commands.clone());
-        pair.on_click(move |_| {
-            send(
-                &ui,
-                &state,
-                &commands,
-                Command::Pair,
-                "Pairing receiver. Hold left, right and middle buttons for 3 seconds. Waiting up to 20 seconds…",
-            );
-        });
-    }
-    {
-        let (state, commands) = (state.clone(), commands.clone());
-        reset.on_click(move |_| {
-            if state.reset_armed.replace(false) {
-                send(
-                    &ui,
-                    &state,
-                    &commands,
-                    Command::Reset,
-                    "Restoring factory settings…",
-                );
-            } else {
-                state.reset_armed.set(true);
-                set_status(
-                    &ui,
-                    "Factory reset clears stored settings. Click again to reset.",
-                );
-                sync(&ui, &state);
-            }
-        });
-    }
-    {
-        let state = state.clone();
-        tabs.on_page_changed(move |_| {
-            state.reset_armed.set(false);
-            sync(&ui, &state);
-        });
-    }
-    {
-        let state = state.clone();
-        stages.on_value_changed(move |_| {
-            let count = usize::try_from(ui.stages.value()).unwrap_or(1);
-            for row in ui.dpi.iter().take(count).filter(|row| !row.1.is_shown()) {
-                set_dpi(row, 800);
-            }
-            ui.active_stage.set_range(1, ui.stages.value().max(1));
-            sync(&ui, &state);
-        });
-    }
-    {
-        let state = state.clone();
-        competitive.on_toggled(move |_| {
-            if !ui.competitive.is_checked() {
-                ui.scanning.set_value(false);
-            }
-            sync(&ui, &state);
-        });
-    }
-    {
-        let state = state.clone();
-        angle_enabled.on_toggled(move |_| sync(&ui, &state));
-    }
-    for (action, _) in buttons {
-        let state = state.clone();
-        action.on_selection_changed(move |_| sync(&ui, &state));
     }
 
     let timer = Timer::new(&frame);
     {
-        let (state, commands) = (state.clone(), commands.clone());
+        let app = app.clone();
         let mut next_connect = None;
         timer.on_tick(move |_| {
             let mut changed = false;
             while let Ok(event) = events.try_recv() {
                 changed = true;
-                state.busy.set(false);
-                match event.result {
-                    Ok(snapshot) => {
-                        next_connect = None;
-                        show_settings(&ui, &state, snapshot);
-                        set_status(&ui, &event.message);
+                match event {
+                    Event::Devices(list, index) => {
+                        picker.clear();
+                        for (_, label) in &list {
+                            picker.append(label);
+                        }
+                        if let Some(index) = index {
+                            picker.set_selection(index as u32);
+                        }
+                        *app.state.devices.borrow_mut() =
+                            list.into_iter().map(|(path, _)| path).collect();
                     }
-                    Err(error) => {
-                        state.connected.set(false);
-                        *state.connection_status.borrow_mut() = if event.connection_attempt {
-                            "Waiting for mouse. Retrying automatically…".into()
-                        } else {
-                            "Operation failed. Reconnect to inspect current settings.".into()
-                        };
-                        set_status(&ui, &error);
-                        next_connect = event
-                            .connection_attempt
-                            .then(|| Instant::now() + Duration::from_secs(2));
-                        *state.current.borrow_mut() = None;
+                    Event::Notice(message) => app.set_status(&message),
+                    Event::Done {
+                        def,
+                        result,
+                        message,
+                        connection_attempt,
+                    } => {
+                        app.state.busy.set(false);
+                        if let Some(def) = def {
+                            let same = app
+                                .state
+                                .form
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|f| Arc::ptr_eq(&f.def, &def));
+                            if !same {
+                                rebuild(&app, def);
+                            }
+                        }
+                        match result {
+                            Ok(snapshot) => {
+                                next_connect = None;
+                                app.state.connected.set(true);
+                                app.state.reset_armed.set(false);
+                                *app.state.details.borrow_mut() =
+                                    format!("{} · {}", snapshot.def.name, snapshot.status);
+                                app.show_values(&snapshot);
+                                *app.state.snapshot.borrow_mut() = Some(snapshot);
+                                app.set_status(&message);
+                            }
+                            Err(error) => {
+                                app.state.connected.set(false);
+                                *app.state.connection_status.borrow_mut() = if connection_attempt {
+                                    "Waiting for mouse. Retrying automatically…".into()
+                                } else {
+                                    "Operation failed. Reconnect to inspect current settings."
+                                        .into()
+                                };
+                                app.set_status(&error);
+                                next_connect = connection_attempt.then(|| Instant::now() + RETRY);
+                                *app.state.snapshot.borrow_mut() = None;
+                            }
+                        }
                     }
                 }
             }
             if changed {
-                sync(&ui, &state);
+                app.sync();
             }
-            if !state.connected.get()
-                && !state.busy.get()
+            if !app.state.connected.get()
+                && !app.state.busy.get()
                 && next_connect.is_some_and(|deadline| Instant::now() >= deadline)
             {
                 next_connect = None;
-                send(
-                    &ui,
-                    &state,
-                    &commands,
-                    Command::Connect,
-                    "Reading mouse settings…",
-                );
+                app.send(Command::Connect(None), "Reading mouse settings…");
             }
         });
     }
@@ -1000,14 +1105,8 @@ fn build(commands: mpsc::Sender<Command>, events: mpsc::Receiver<Event>) {
         event.skip(true);
     });
 
-    sync(&ui, &state);
-    send(
-        &ui,
-        &state,
-        &commands,
-        Command::Connect,
-        "Reading mouse settings…",
-    );
+    app.sync();
+    app.send(Command::Connect(None), "Reading mouse settings…");
     frame.show(true);
     frame.centre();
 }
