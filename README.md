@@ -8,6 +8,7 @@ Supported mice:
 |---|---|---|
 | Scyrox V8 | Cable or receiver | [devices/scyrox-v8.toml](devices/scyrox-v8.toml) |
 | MCHOSE L7 Pro, L7 Ultra+ | Cable, 8K or 1K receiver | [devices/mchose-l7.toml](devices/mchose-l7.toml) |
+| Endgame Gear OP1 8k v2 | Cable | [devices/endgame-op1-8k-v2.toml](devices/endgame-op1-8k-v2.toml) |
 
 Each mouse is described by a TOML device file on top of a small Rust "family" that frames its reports. To add a mouse, see [docs/device-files.md](docs/device-files.md). Coding agents follow the step-by-step procedure in [AGENTS.md](AGENTS.md). A mouse that uses a supported family needs only a TOML file, and the app loads it from `%APPDATA%\scycocks\devices\` without a rebuild.
 
@@ -37,13 +38,15 @@ The window uses standard native controls: an Info box with the mouse picker, one
 - **Scyrox V8:** four onboard profiles where the firmware supports them, polling rate limited by the connection, 0.7/1/2 mm lift-off, one to eight DPI stages (50 to 30,000 in steps of 50), Motion Sync, angle snapping, ripple control, Competitive Mode, 20K scanning (requires Competitive Mode), sleep time, angle tuning, debounce, receiver pairing, factory reset, and six button bindings.
 - **MCHOSE L7 Pro / Ultra+:** three onboard profiles, polling rate (the 1K receiver stops at 1000 Hz, and wired and wireless keep separate rates), lift-off (0.7 mm on the Ultra+ only), one to six DPI stages with separate X/Y (to 26,000 or 42,000), angle snapping, ripple control, Motion Sync, Performance/Gaming/Extreme mode, sensor angle, debounce, sleep timer, factory reset, and five button bindings.
 
+- **Endgame Gear OP1 8k v2:** one to four CPI stages with separate X/Y (10 to 30,000), polling rate up to 8000 Hz, 0.7 to 1.7 mm lift-off, angle snapping, LED on lift-off, Motion Sync, forced max sensor fps, smoothing (ripple) and CPI-downshift tuning, sensor angle tuning, Slamclick filter, per-button multiclick filters with GX Speed / GX Safe Mode on left and right, and bindings for five buttons and the wheel. Factory reset is not offered because the vendor tool never sends it.
+
 Keyboard shortcuts take one key plus modifiers, such as `Ctrl+C`, `Ctrl+Shift+A`, `Alt+F4`, `Win+D`, or `RCtrl+NumEnter`. Media keys are `VolumeUp`, `VolumeDown`, `Mute`, `PlayPause`, `Stop`, `NextTrack`, `PreviousTrack`, `BrowserBack`, `BrowserForward`, `BrowserHome`, `BrowserRefresh`, and `Calculator`.
 
 **Load profile** switches immediately and discards pending edits. **Factory reset** clears stored settings; click once to arm it, then click **Click again to reset**.
 
 To pair a Scyrox receiver, connect only the receiver. Hold the mouse's left, right, and middle buttons for three seconds until its light flashes. Keep it near the receiver and select **Pair receiver**. Pairing works while the mouse is offline.
 
-Macros, firmware flashing, and MCHOSE profile names are excluded. Button bindings the app cannot decode are preserved unless you replace them. Scyrox V6 and PAW3955 models are rejected. Settings reads are verified on a Scyrox V8 and an MCHOSE L7 Pro; writes match the vendor implementations byte for byte in tests, but profile switching, pairing, and reset through this app still need hardware validation.
+Macros, firmware flashing, and MCHOSE profile names are excluded. Button bindings the app cannot decode are preserved unless you replace them. Scyrox V6 and PAW3955 models are rejected. Settings reads are verified on a Scyrox V8, an MCHOSE L7 Pro and an Endgame Gear OP1 8k v2; writes match the vendor implementations byte for byte in tests, but profile switching, pairing, and reset through this app still need hardware validation.
 
 ## Safety
 
@@ -84,7 +87,7 @@ Engine tests check the exact frames each device file produces against the origin
 cargo test --no-default-features --locked
 ```
 
-Protocol notes: [docs/protocol.md](docs/protocol.md) (Scyrox: sources, artifact hashes, firmware findings, investigation limits) and [docs/protocol-mchose.md](docs/protocol-mchose.md) (MCHOSE, ported from the open-mchose project). Proprietary artifacts stay in the ignored `.local/` directory and are not part of the application.
+Protocol notes: [docs/protocol.md](docs/protocol.md) (Scyrox: sources, artifact hashes, firmware findings, investigation limits) [docs/protocol-mchose.md](docs/protocol-mchose.md) (MCHOSE, ported from the open-mchose project) and [docs/protocol-endgame.md](docs/protocol-endgame.md) (Endgame Gear, from the vendor configurator). Proprietary artifacts stay in the ignored `.local/` directory and are not part of the application.
 
 ## License
 

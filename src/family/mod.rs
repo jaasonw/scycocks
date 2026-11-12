@@ -4,6 +4,7 @@
 use crate::driver::codec::Codec;
 use std::time::Duration;
 
+mod endgame;
 mod mchose;
 mod scyrox;
 
@@ -21,7 +22,7 @@ pub struct Family {
     pub codec: fn(&str) -> Option<Codec>,
 }
 
-pub static FAMILIES: &[Family] = &[scyrox::FAMILY, mchose::FAMILY];
+pub static FAMILIES: &[Family] = &[scyrox::FAMILY, mchose::FAMILY, endgame::FAMILY];
 
 pub fn find(name: &str) -> Option<&'static Family> {
     FAMILIES.iter().find(|family| family.name == name)

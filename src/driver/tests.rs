@@ -331,3 +331,90 @@ fn mchose_variants_pick_link_and_model() {
         "the L7 Pro has no 0.7 mm lift-off"
     );
 }
+
+/// Blob laid out as the OP1 8k v2 vendor tool reads it (`FUN_00403c40`).
+fn op1() -> (Device, Snapshot) {
+    let device = device("endgame-op1-8k-v2.toml", &[]);
+    let mut blob = vec![0u8; device.def.size];
+    blob[1] = 0x5A; // unmapped by the vendor tool, written back as 0
+    blob[5] = 0x08; // 1000 Hz
+    blob[9] = 3; // 1.0 mm
+    blob[0x0B] = 0x01; // ripple on, downshift default
+    blob[0x0D] = 0; // active stage
+    blob[0x0E] = 2; // two stages
+    for (stage, dpi) in [800u16, 1600, 3200, 6400].into_iter().enumerate() {
+        let at = 0x23 + stage * 5;
+        blob[at + 1..at + 3].copy_from_slice(&dpi.to_le_bytes());
+        blob[at + 3..at + 5].copy_from_slice(&dpi.to_le_bytes());
+    }
+    for (i, mask) in [1u8, 2, 4, 0x10, 8].into_iter().enumerate() {
+        blob[0x37 + i * 7 + 1] = mask;
+        blob[0x37 + i * 7 + 6] = 8;
+    }
+    blob[0x37 + 6 * 7..0x37 + 6 * 7 + 2].copy_from_slice(&[1, 1]);
+    blob[0x37 + 7 * 7..0x37 + 7 * 7 + 2].copy_from_slice(&[1, 0xFF]);
+    let snapshot = snapshot(&device, blob);
+    (device, snapshot)
+}
+
+#[test]
+fn op1_decodes_vendor_layout() {
+    let (device, old) = op1();
+    let get = |id| &old.values[device.def.field(id).unwrap().0];
+    let Value::Dpi(dpi) = get("dpi") else {
+        unreachable!()
+    };
+    assert_eq!((dpi.count, dpi.active, dpi.stages[1]), (2, 0, (1600, 1600)));
+    assert_eq!(
+        [
+            get("rate"),
+            get("lod"),
+            get("ripple"),
+            get("downshift"),
+            get("left_filter")
+        ],
+        [
+            &Value::Int(8),
+            &Value::Int(3),
+            &Value::Int(1),
+            &Value::Int(0),
+            &Value::Int(8)
+        ]
+    );
+    let Value::Buttons(wheel) = get("wheel") else {
+        unreachable!()
+    };
+    assert_eq!(wheel, &[Action::Wheel(1), Action::Wheel(-1)]);
+    assert!(frames(&device, &old, &old.values).unwrap().is_empty());
+}
+
+#[test]
+fn op1_writes_whole_blob_like_the_vendor_tool() {
+    let (device, old) = op1();
+    let mut values = old.values.clone();
+    set(&device, &mut values, "slamclick", Value::Bool(true));
+    set(&device, &mut values, "left_filter", Value::Int(0xF1));
+    set(&device, &mut values, "downshift", Value::Int(3));
+    let Value::Dpi(mut dpi) = values[0].clone() else {
+        unreachable!()
+    };
+    dpi.stages[1] = (12_050, 1600);
+    values[0] = Value::Dpi(dpi);
+    let frames = frames(&device, &old, &values).unwrap();
+    assert_eq!(frames.len(), 1, "one blob write covers every field");
+    let frame = &frames[0];
+    assert_eq!(
+        frame[..16],
+        [0xA0, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    );
+    let blob = &frame[16..];
+    assert_eq!(blob[1], 0, "vendor-unmapped bytes are written as 0");
+    assert_eq!((blob[6], blob[0x0B], blob[0x3D]), (0x01, 0x0D, 0xF1));
+    assert_eq!(blob[0x28..0x2D], [1, 0x12, 0x2F, 0x40, 0x06]);
+    let mut bad = values.clone();
+    set(&device, &mut bad, "middle_filter", Value::Int(0xF1));
+    assert!(
+        device.frames(&old, &bad).is_err(),
+        "GX modes exist only on left and right"
+    );
+}

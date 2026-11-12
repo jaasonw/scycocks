@@ -211,7 +211,8 @@ struct Shell {
 
 #[derive(Clone, Copy)]
 struct DpiRow {
-    caption: StaticText,
+    /// Labelled "CPI n"; the checked stage is the active one.
+    active: RadioButton,
     slider: Slider,
     x: SpinCtrlDouble,
     y: Option<(StaticText, SpinCtrlDouble)>,
@@ -228,10 +229,11 @@ enum Item {
 enum Control {
     Toggle(CheckBox),
     Choice(Choice, Vec<i64>),
-    Range(SpinCtrl, Option<Slider>),
+    /// Spin box, optional slider, optional mode list whose items after the first are the
+    /// field's special values.
+    Range(SpinCtrl, Option<Slider>, Option<(Choice, Vec<i64>)>),
     Dpi {
         count: SpinCtrl,
-        active: SpinCtrl,
         rows: Vec<DpiRow>,
     },
     Buttons(Vec<(Choice, TextCtrl)>, Vec<Item>),
@@ -293,7 +295,8 @@ fn choice(parent: &impl WxWidget, items: &[&str]) -> Choice {
 fn row(page: &BoxSizer, parent: &Panel, caption: &str) -> (BoxSizer, StaticText) {
     let row = BoxSizer::builder(Orientation::Horizontal).build();
     let caption = text(parent, caption);
-    caption.set_min_size(Size::new(120, -1));
+    // A fixed minimum would clip longer labels; keep the column but let a label grow.
+    caption.set_min_size(Size::new(caption.get_best_size().width.max(150), -1));
     row.add(&caption, 0, SizerFlag::AlignCenterVertical, 0);
     page.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 6);
     (row, caption)
@@ -376,24 +379,26 @@ impl App {
                 match control {
                     Control::Toggle(check) => check.enable(on),
                     Control::Choice(choice, _) => choice.enable(on),
-                    Control::Range(spin, slider) => {
-                        spin.enable(on);
+                    Control::Range(spin, slider, mode) => {
+                        let number = on
+                            && mode
+                                .as_ref()
+                                .is_none_or(|(m, _)| m.get_selection() == Some(0));
+                        spin.enable(number);
                         if let Some(slider) = slider {
-                            slider.enable(on);
+                            slider.enable(number);
+                        }
+                        if let Some((mode, _)) = mode {
+                            mode.enable(on);
                         }
                     }
-                    Control::Dpi {
-                        count,
-                        active,
-                        rows,
-                    } => {
+                    Control::Dpi { count, rows } => {
                         count.enable(on);
-                        active.enable(on);
                         let stages = usize::try_from(count.value()).unwrap_or(1);
-                        active.set_range(1, count.value().max(1));
                         for (index, row) in rows.iter().enumerate() {
                             let shown = index < stages;
-                            row.caption.show(shown);
+                            row.active.show(shown);
+                            row.active.enable(on);
                             row.slider.show(shown);
                             row.slider.enable(on);
                             if let Some((label, _)) = row.y {
@@ -460,24 +465,26 @@ impl App {
                         choice.set_selection(index as u32);
                     }
                 }
-                (Control::Range(spin, slider), Value::Int(v)) => {
-                    let v = i32::try_from(*v).unwrap_or_default();
-                    spin.set_value(v);
-                    if let Some(slider) = slider {
-                        slider.set_value(v);
+                (Control::Range(spin, slider, mode), Value::Int(v)) => {
+                    let special = mode
+                        .as_ref()
+                        .and_then(|(m, values)| Some((m, values.iter().position(|x| x == v)?)));
+                    if let Some((mode, _)) = mode {
+                        mode.set_selection(special.map_or(0, |(_, i)| i as u32 + 1));
+                    }
+                    if special.is_none() {
+                        let v = i32::try_from(*v).unwrap_or_default();
+                        spin.set_value(v);
+                        if let Some(slider) = slider {
+                            slider.set_value(v);
+                        }
                     }
                 }
-                (
-                    Control::Dpi {
-                        count,
-                        active,
-                        rows,
-                    },
-                    Value::Dpi(dpi),
-                ) => {
+                (Control::Dpi { count, rows }, Value::Dpi(dpi)) => {
                     count.set_value(dpi.count as i32);
-                    active.set_range(1, dpi.count as i32);
-                    active.set_value(dpi.active as i32 + 1);
+                    if let Some(row) = rows.get(dpi.active) {
+                        row.active.set_value(true);
+                    }
                     for (row, &(x, y)) in rows.iter().zip(&dpi.stages) {
                         if (x, y) != (0, 0) {
                             set_dpi(row, x, y);
@@ -523,19 +530,26 @@ impl App {
                         .and_then(|i| options.get(i as usize))
                         .ok_or_else(|| format!("Select a {}.", field.label.to_lowercase()))?,
                 ),
-                Control::Range(spin, _) => Value::Int(i64::from(spin.value())),
-                Control::Dpi {
-                    count,
-                    active,
-                    rows,
-                } => {
+                Control::Range(spin, _, mode) => Value::Int(
+                    mode.as_ref()
+                        .and_then(|(m, values)| {
+                            values
+                                .get((m.get_selection()? as usize).checked_sub(1)?)
+                                .copied()
+                        })
+                        .unwrap_or_else(|| i64::from(spin.value())),
+                ),
+                Control::Dpi { count, rows } => {
                     let Value::Dpi(old) = old else {
                         return Err("Stale DPI settings.".into());
                     };
                     let count =
                         usize::try_from(count.value()).map_err(|_| "Invalid DPI stage count.")?;
-                    let active = usize::try_from(active.value() - 1)
-                        .map_err(|_| "Select a valid DPI stage.")?;
+                    let active = rows
+                        .iter()
+                        .take(count)
+                        .position(|row| row.active.get_value())
+                        .ok_or("Select the active DPI stage.")?;
                     let value =
                         |spin: SpinCtrlDouble| spin.get_value().round().clamp(0.0, 65535.0) as u16;
                     let stages = rows
@@ -675,6 +689,15 @@ fn build_form(app: &Rc<App>, def: Arc<Def>) -> Form {
                 let (r, _) = row(&sizer, &panel, &field.label);
                 let (min, max) = (field.min.unwrap_or(0) as i32, field.max.unwrap_or(0) as i32);
                 let spin = SpinCtrl::builder(&panel).with_range(min, max).build();
+                let mode = (!field.options.is_empty()).then(|| {
+                    let mut labels = vec!["Value".to_string()];
+                    labels.extend(field.options.iter().map(|o| o.label.clone()));
+                    let mode = Choice::builder(&panel).with_choices(labels).build();
+                    put(&r, &mode);
+                    let app = app.clone();
+                    mode.on_selection_changed(move |_| app.sync());
+                    (mode, field.options.iter().map(|o| o.value).collect())
+                });
                 let slider = field.slider.then(|| {
                     let slider = Slider::builder(&panel)
                         .with_min_value(min)
@@ -695,7 +718,7 @@ fn build_form(app: &Rc<App>, def: Arc<Def>) -> Form {
                 if let Some(unit) = &field.unit {
                     put(&r, &text(&panel, unit));
                 }
-                Control::Range(spin, slider)
+                Control::Range(spin, slider, mode)
             }
             Kind::Dpi => {
                 let slots = field.stages.unwrap_or(1);
@@ -704,20 +727,26 @@ fn build_form(app: &Rc<App>, def: Arc<Def>) -> Form {
                     field.max.unwrap_or(30000) as f64,
                 );
                 let step = field.step.unwrap_or(50).max(1) as f64;
-                let (r, _) = row(&sizer, &panel, "Active DPI stage");
-                let active = SpinCtrl::builder(&panel)
-                    .with_range(1, slots as i32)
-                    .build();
+                let (r, _) = row(&sizer, &panel, &format!("{} stages", field.label));
                 let count = SpinCtrl::builder(&panel)
                     .with_range(1, slots as i32)
                     .build();
-                put(&r, &active);
-                put(&r, &text(&panel, "Stages"));
                 put(&r, &count);
                 let rows: Vec<DpiRow> = (0..slots)
                     .map(|index| {
-                        let (r, caption) =
-                            row(&sizer, &panel, &format!("{} {}", field.label, index + 1));
+                        let r = BoxSizer::builder(Orientation::Horizontal).build();
+                        let mut active = RadioButton::builder(&panel).with_label(&format!(
+                            "{} {}",
+                            field.label,
+                            index + 1
+                        ));
+                        if index == 0 {
+                            active = active.first_in_group();
+                        }
+                        let active = active.build();
+                        active.set_min_size(Size::new(150, -1));
+                        r.add(&active, 0, SizerFlag::AlignCenterVertical, 0);
+                        sizer.add_sizer(&r, 0, SizerFlag::Expand | SizerFlag::All, 6);
                         let slider = Slider::builder(&panel)
                             .with_min_value(min as i32)
                             .with_max_value(max as i32)
@@ -746,7 +775,7 @@ fn build_form(app: &Rc<App>, def: Arc<Def>) -> Form {
                         });
                         x.on_value_changed(move |_| slider.set_value(x.get_value().round() as i32));
                         DpiRow {
-                            caption,
+                            active,
                             slider,
                             x,
                             y,
@@ -760,13 +789,18 @@ fn build_form(app: &Rc<App>, def: Arc<Def>) -> Form {
                     for row in new_rows.iter().take(stages).filter(|row| !row.x.is_shown()) {
                         set_dpi(row, 800, 800);
                     }
+                    // A hidden stage cannot stay active; fall back to the last visible one.
+                    if !new_rows
+                        .iter()
+                        .take(stages)
+                        .any(|row| row.active.get_value())
+                        && let Some(row) = new_rows.get(stages.max(1) - 1)
+                    {
+                        row.active.set_value(true);
+                    }
                     app.sync();
                 });
-                Control::Dpi {
-                    count,
-                    active,
-                    rows,
-                }
+                Control::Dpi { count, rows }
             }
             Kind::Buttons => {
                 let profiles = def.profiles.as_ref().map_or(0, |p| p.count);

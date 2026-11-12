@@ -13,8 +13,9 @@ You do not need to rebuild the app. Put the file in `%APPDATA%\scycocks\devices\
 (`~/.config/scycocks/devices/` elsewhere). A file with the same name as a built-in file
 replaces that built-in file. Problems in a file show in the status line at startup.
 
-Families: `scyrox` (output report 8, `0x55` sum checksum) and `mchose` (feature reports
-`0x11`/`0x12`, XOR `0xFF`, `E5` acknowledgement).
+Families: `scyrox` (output report 8, `0x55` sum checksum), `mchose` (feature reports
+`0x11`/`0x12`, XOR `0xFF`, `E5` acknowledgement) and `endgame` (feature reports
+`0xA1`/`0xA0`, status byte with busy polling).
 
 Use `scycocks --list` to show the devices that match. Use `scycocks --inspect` to read
 every matched device and print its decoded settings. Neither command writes to the mouse.
@@ -50,6 +51,7 @@ The engine orders writes so that the mouse never holds an invalid state:
 | `size` | Buffer size in bytes. |
 | `timeout_ms` | Reply timeout for each frame. Default 800. |
 | `volatile` | Buffer offsets that the firmware changes without a command. |
+| `zero` | Buffer offsets always written as 0 (bytes the vendor tool never sends back). |
 | `[[match]]` | HID facts that must all match: `vid`, `pid`, `usage_page`, `usage`, `interface`, `product`. Each key takes one value or a list. Add more than one `[[match]]` to accept alternatives. |
 
 ## Frames and templates
@@ -60,6 +62,7 @@ also write `{ frame = [...], timeout_ms = 6000 }` for a slow command.
 | Variable | Bytes |
 |---|---|
 | `addr16be`, `addr16le`, `len`, `data` | Memory address, length, and data in `[read]`/`[write]` |
+| `buffer` | The whole encoded settings buffer, for devices that write everything at once |
 | `profile` | Profile index in `[profiles].set` |
 | `<field>` | Field value as one byte. Negative values use two's complement. |
 | `<field>:flag12` | 1 if on, 2 if off |
@@ -111,7 +114,8 @@ error = "The mouse is offline."
 [[status]]                            # shown in the Info box
 label = "Battery"
 frame = [0x04, 0, 0, 0, 0]
-format = "{5}%"                       # {N} decimal, {N:02x} hex, {N:str} length-prefixed text
+format = "{5}%"                       # {N} decimal, {N:02x} hex, {N:str} length-prefixed text,
+                                      # {N:u16le} u16, {N:u16le/100} u16 as a version (1.14)
 charging = 6                          # optional: reply byte that is 1 while charging
 
 [profiles]
@@ -148,7 +152,7 @@ engine reads the first location and writes all of them (for mirrored bytes).
 |---|---|
 | `toggle` | `at`. Stored as 0 or 1. |
 | `choice` | `at`, `options = [{ label, value, send? }]`, `limit` (offer only the first N options) |
-| `range` | `at`, `min`, `max`, `unit`, `slider` |
+| `range` | `at`, `min`, `max`, `unit`, `slider`, optional `options` (named special values outside `min`..`max`, shown as a mode list) |
 | `dpi` | `stages` (slots), `min`, `max`, `step`, `count`, `active`, `x`, optional `y`, `xy` (separate X/Y editing) |
 | `buttons` | `names`, `at` (with `stride`), optional `extra` (second region per button), `actions`, `left_click` |
 
@@ -163,6 +167,7 @@ Generic: `u8`, `i8`, `u16le`, `u16be`.
 Scyrox: `scyrox_checked`, `scyrox_checked_i8` (value plus `0x55` checksum byte),
 `scyrox_dpi` (X/Y pair), `scyrox_button` (binding with a 32-byte shortcut slot in `extra`).
 MCHOSE: `mchose_button`.
+Endgame Gear: `endgame_dpi` (5-byte X/Y stage record with an X≠Y flag), `endgame_button`.
 
 ## Adding a family
 

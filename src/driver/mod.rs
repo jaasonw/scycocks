@@ -22,6 +22,10 @@ const BUILTIN: &[(&str, &str)] = &[
         "mchose-l7.toml",
         include_str!("../../devices/mchose-l7.toml"),
     ),
+    (
+        "endgame-op1-8k-v2.toml",
+        include_str!("../../devices/endgame-op1-8k-v2.toml"),
+    ),
 ];
 
 pub struct Entry {
@@ -359,6 +363,7 @@ impl Device {
             ),
             "len" => out.push(ctx.len as u8),
             "data" => out.extend_from_slice(ctx.data),
+            "buffer" => out.extend_from_slice(ctx.buffer),
             "profile" => out.push(ctx.profile),
             "index" => out.push(ctx.index as u8),
             _ if name.starts_with("span[") => {
@@ -547,7 +552,12 @@ impl Device {
             Kind::Range => {
                 let (min, max) = (field.min.unwrap_or(0), field.max.unwrap_or(0));
                 match scalar() {
-                    Ok(v) if (min..=max).contains(&v) => Value::Int(v),
+                    Ok(v)
+                        if (min..=max).contains(&v)
+                            || field.options.iter().any(|o| o.value == v) =>
+                    {
+                        Value::Int(v)
+                    }
                     _ if field.optional => Value::Int(0.clamp(min, max)),
                     Ok(_) => return Err(unknown()),
                     Err(error) => return Err(error),
@@ -715,7 +725,7 @@ impl Device {
                 }
                 Value::Int(v) => {
                     let (min, max) = (field.min.unwrap_or(i64::MIN), field.max.unwrap_or(i64::MAX));
-                    if !(min..=max).contains(v) {
+                    if !(min..=max).contains(v) && !field.options.iter().any(|o| o.value == *v) {
                         let unit = field
                             .unit
                             .as_deref()
@@ -854,7 +864,11 @@ impl Device {
 
     fn compare(&self, expected: &[u8], actual: &[u8]) -> Vec<usize> {
         (0..expected.len().min(actual.len()))
-            .filter(|i| !self.def.volatile.contains(i) && expected[*i] != actual[*i])
+            .filter(|i| {
+                !self.def.volatile.contains(i)
+                    && !self.def.zero.contains(i)
+                    && expected[*i] != actual[*i]
+            })
             .collect()
     }
 
@@ -863,6 +877,11 @@ impl Device {
         self.validate(values)?;
         let mut after = old.buffer.clone();
         self.encode(values, &mut after)?;
+        for &offset in &self.def.zero {
+            if let Some(byte) = after.get_mut(offset) {
+                *byte = 0;
+            }
+        }
         let mut frames = Vec::new();
         for (command, button, span) in self.plan(&old.values, values, &old.buffer, &after)? {
             if let Some(c) = command {
@@ -1015,7 +1034,8 @@ impl Device {
     }
 }
 
-/// `{N}` decimal byte, `{N:02x}` two-digit hex byte, `{N:str}` length-prefixed UTF-8 string.
+/// `{N}` decimal byte, `{N:02x}` two-digit hex byte, `{N:str}` length-prefixed UTF-8 string,
+/// `{N:u16le}` little-endian u16, `{N:u16le/100}` the same as a version such as `1.14`.
 fn format_reply(format: &str, reply: &[u8]) -> Result<String, String> {
     let mut out = String::new();
     let mut rest = format;
@@ -1035,6 +1055,15 @@ fn format_reply(format: &str, reply: &[u8]) -> Result<String, String> {
         match style {
             "" => out.push_str(&byte.to_string()),
             "02x" => out.push_str(&format!("{byte:02x}")),
+            "u16le" | "u16le/100" => {
+                let value =
+                    u16::from_le_bytes([byte, *reply.get(index + 1).ok_or("Short status reply.")?]);
+                if style == "u16le" {
+                    out.push_str(&value.to_string());
+                } else {
+                    out.push_str(&format!("{}.{:02}", value / 100, value % 100));
+                }
+            }
             "str" => {
                 let end = (index + 1 + usize::from(byte)).min(reply.len());
                 out.push_str(&String::from_utf8_lossy(&reply[index + 1..end]));

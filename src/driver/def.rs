@@ -63,6 +63,9 @@ pub struct Def {
     /// Buffer offsets the firmware changes on its own; ignored by readback checks.
     #[serde(default)]
     pub volatile: Vec<usize>,
+    /// Buffer offsets always written as 0, as the vendor tool does; ignored by readback checks.
+    #[serde(default)]
+    pub zero: Vec<usize>,
     pub online: Option<Check>,
     #[serde(default)]
     pub status: Vec<Status>,
@@ -201,6 +204,7 @@ pub struct Field {
     /// Undecodable values read as the default instead of failing the read.
     #[serde(default)]
     pub optional: bool,
+    /// Choices for `choice`; for `range`, named special values outside `min`..`max`.
     #[serde(default)]
     pub options: Vec<Opt>,
     /// Offer only the first `limit` options, such as the rates a receiver supports.

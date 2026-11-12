@@ -15,6 +15,12 @@ Do these steps in order. Stop and ask the user when a step says so.
    the frame layout, the checksum, how settings are read, and how each setting is written.
    Put the notes in `docs/protocol-<vendor>.md`. Do not commit proprietary binaries or
    bundles; keep them in the ignored `.local/` directory.
+   - For a native vendor app, decompile it with Ghidra headless and search the output:
+     `analyzeHeadless <dir> proj -import <exe> -postScript DumpAll.java <out.c> -scriptPath scripts/ghidra -deleteProject`.
+     Start from the `HidD_SetFeature`/`GetFeature` or `WriteFile` call sites, then follow the
+     settings struct into the dialog code. MFC `DDX_Control` calls map member offsets to
+     control IDs, and the dialog and `DLGINIT` resources map control IDs to labels and
+     combo items. `docs/protocol-endgame.md` is a worked example.
 2. **Choose the family.** Compare the framing with `src/family/scyrox.rs` and
    `src/family/mchose.rs`. If one of them matches, use it and go to step 4.
 3. **Add a family only if no family matches.** Create `src/family/<name>.rs` with a
