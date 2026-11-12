@@ -959,7 +959,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// wxdragon has no binding for this static method, and the static wx library exports it.
+#[cfg(target_env = "msvc")]
+unsafe extern "C" {
+    #[link_name = "?UseDefault@wxUILocale@@SA_NXZ"]
+    fn wx_ui_locale_use_default() -> bool;
+}
+
 fn build(commands: mpsc::Sender<Command>, events: mpsc::Receiver<Event>) {
+    // Without a UI locale, wx looks up the C locale's text direction in its language
+    // table, which builds about 900 entries (0.7 MB) on the first window.
+    #[cfg(target_env = "msvc")]
+    // SAFETY: called on the GUI thread after wx initialization; it takes no arguments.
+    unsafe {
+        wx_ui_locale_use_default();
+    }
     let frame = Frame::builder()
         .with_title("Scycocks · Mouse Configuration Tool")
         .with_size(Size::new(680, 760))

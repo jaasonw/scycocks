@@ -13,12 +13,12 @@ impl Link for Offline {
 
 fn device(source: &str, facts: &[(&str, Fact)]) -> Device {
     let text = BUILTIN.iter().find(|(name, _)| *name == source).unwrap().1;
-    let (table, def) = parse(text).unwrap();
+    parse(text).unwrap();
     let facts: Facts = facts
         .iter()
         .map(|(k, v)| ((*k).to_string(), v.clone()))
         .collect();
-    let def = def.resolve(&table, &facts).unwrap();
+    let def = Def::resolve(text, &facts).unwrap();
     Device {
         family: family::find(&def.family).unwrap(),
         def: Arc::new(def),

@@ -8,6 +8,7 @@ use crate::action::Action;
 use crate::family::{self, Family, Link};
 use codec::Codec;
 use def::{Def, Fact, Facts, Kind, Loc, OneOrMany, ProfileSource, Template, Token};
+use std::borrow::Cow;
 use std::ffi::CString;
 use std::ops::Range;
 use std::sync::Arc;
@@ -30,7 +31,7 @@ const BUILTIN: &[(&str, &str)] = &[
 
 pub struct Entry {
     pub source: String,
-    pub table: toml::Table,
+    pub text: Cow<'static, str>,
     pub def: Def,
 }
 
@@ -47,9 +48,9 @@ pub fn user_dir() -> Option<std::path::PathBuf> {
 
 /// Built-in definitions plus user files. Broken user files are skipped and reported.
 pub fn load() -> (Vec<Entry>, Vec<String>) {
-    let mut files: Vec<(String, String)> = BUILTIN
+    let mut files: Vec<(String, Cow<'static, str>)> = BUILTIN
         .iter()
-        .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
+        .map(|(name, text)| ((*name).to_string(), Cow::Borrowed(*text)))
         .collect();
     let mut problems = Vec::new();
     if let Some(dir) = user_dir()
@@ -68,7 +69,7 @@ pub fn load() -> (Vec<Entry>, Vec<String>) {
             match std::fs::read_to_string(&path) {
                 Ok(text) => {
                     files.retain(|(existing, _)| *existing != name);
-                    files.push((name, text));
+                    files.push((name, Cow::Owned(text)));
                 }
                 Err(error) => problems.push(format!("{}: {error}", path.display())),
             }
@@ -77,19 +78,19 @@ pub fn load() -> (Vec<Entry>, Vec<String>) {
     let mut entries = Vec::new();
     for (source, text) in files {
         match parse(&text) {
-            Ok((table, def)) => entries.push(Entry { source, table, def }),
+            Ok(def) => entries.push(Entry { source, text, def }),
             Err(error) => problems.push(format!("{source}: {error}")),
         }
     }
     (entries, problems)
 }
 
-pub fn parse(text: &str) -> Result<(toml::Table, Def), String> {
+pub fn parse(text: &str) -> Result<Def, String> {
     let def = Def::parse(text)?;
     let family =
         family::find(&def.family).ok_or_else(|| format!("Unknown family `{}`.", def.family))?;
     check_codecs(&def, family)?;
-    Ok((toml::from_str(text).map_err(|e| e.to_string())?, def))
+    Ok(def)
 }
 
 fn codec_for(family: &Family, name: &str) -> Result<Codec, String> {
@@ -271,7 +272,7 @@ impl Device {
                 return Err(require.error.clone());
             }
         }
-        let resolved = entry.def.resolve(&entry.table, &facts)?;
+        let resolved = Def::resolve(&entry.text, &facts)?;
         check_codecs(&resolved, family)?;
         device.def = Arc::new(resolved);
         Ok(device)

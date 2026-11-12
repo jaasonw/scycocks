@@ -54,9 +54,6 @@ pub struct Def {
     pub identify: Vec<Identify>,
     #[serde(default)]
     pub require: Vec<Require>,
-    /// Kept raw; matching variants are merged into the definition after `identify`.
-    #[serde(default)]
-    pub variant: Vec<toml::Table>,
     pub size: usize,
     pub read: Read,
     pub write: Option<Write>,
@@ -300,33 +297,17 @@ impl Template {
 
 impl Def {
     pub fn parse(text: &str) -> Result<Self, String> {
-        let table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
-        let def = Self::from_table(table)?;
+        let (base, variants) = split(text)?;
         // Every variant must also produce a valid definition.
-        for variant in &def.variant {
-            let mut table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
-            let mut variant = variant.clone();
-            variant.remove("when");
-            merge(&mut table, variant);
+        for (_, variant) in &variants {
+            let mut table = base.clone();
+            merge(&mut table, variant.clone());
             Self::from_table(table)?;
         }
-        Ok(def)
+        Self::from_table(base)
     }
 
-    fn from_table(mut table: toml::Table) -> Result<Self, String> {
-        if let Some(variants) = table.get_mut("variant").and_then(toml::Value::as_array_mut) {
-            for variant in variants {
-                if let Some(variant) = variant.as_table() {
-                    // `when` is checked against facts; the rest overrides the base.
-                    let _: When = variant
-                        .get("when")
-                        .ok_or("Every [[variant]] needs a `when` table.")?
-                        .clone()
-                        .try_into()
-                        .map_err(|e: toml::de::Error| format!("variant.when: {e}"))?;
-                }
-            }
-        }
+    fn from_table(table: toml::Table) -> Result<Self, String> {
         let def: Self = table
             .try_into()
             .map_err(|e: toml::de::Error| e.to_string())?;
@@ -334,18 +315,12 @@ impl Def {
         Ok(def)
     }
 
-    /// The definition with every variant whose `when` matches `facts` merged in, in file order.
-    pub fn resolve(&self, base: &toml::Table, facts: &Facts) -> Result<Self, String> {
-        let mut table = base.clone();
-        table.remove("variant");
-        for variant in &self.variant {
-            let when: When = variant["when"]
-                .clone()
-                .try_into()
-                .map_err(|e: toml::de::Error| e.to_string())?;
+    /// The definition in `text` with every variant whose `when` matches `facts` merged in,
+    /// in file order. Parsed again on each call so loaded files do not keep TOML trees.
+    pub fn resolve(text: &str, facts: &Facts) -> Result<Self, String> {
+        let (mut table, variants) = split(text)?;
+        for (when, variant) in variants {
             if matches(&when, facts) {
-                let mut variant = variant.clone();
-                variant.remove("when");
                 merge(&mut table, variant);
             }
         }
@@ -436,6 +411,32 @@ impl Def {
         }
         Ok(())
     }
+}
+
+/// The base table and each `[[variant]]` as its `when` and its overrides.
+fn split(text: &str) -> Result<(toml::Table, Vec<(When, toml::Table)>), String> {
+    let mut table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+    let variants = match table.remove("variant") {
+        None => Vec::new(),
+        Some(toml::Value::Array(items)) => items,
+        Some(_) => return Err("`variant` must be a list of tables.".into()),
+    };
+    let variants = variants
+        .into_iter()
+        .map(|item| {
+            let toml::Value::Table(mut variant) = item else {
+                return Err("Every [[variant]] must be a table.".to_string());
+            };
+            // `when` is checked against facts; the rest overrides the base.
+            let when = variant
+                .remove("when")
+                .ok_or("Every [[variant]] needs a `when` table.")?
+                .try_into()
+                .map_err(|e: toml::de::Error| format!("variant.when: {e}"))?;
+            Ok((when, variant))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok((table, variants))
 }
 
 /// Deep merge: tables merge by key, arrays of tables with `id` merge by `id`, anything else
