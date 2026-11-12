@@ -229,6 +229,8 @@ enum Control {
     Range(SpinCtrl, Option<Slider>, Option<(Choice, Vec<i64>)>),
     Dpi {
         count: SpinCtrl,
+        /// Present when the device stores X and Y apart; unchecked, Y follows X.
+        separate: Option<CheckBox>,
         rows: Vec<DpiRow>,
     },
     Buttons(Vec<(Choice, TextCtrl)>, Vec<Item>),
@@ -387,8 +389,16 @@ impl App {
                             mode.enable(on);
                         }
                     }
-                    Control::Dpi { count, rows } => {
+                    Control::Dpi {
+                        count,
+                        separate,
+                        rows,
+                    } => {
                         count.enable(on);
+                        if let Some(separate) = separate {
+                            separate.enable(on);
+                        }
+                        let split = separate.is_some_and(|c| c.is_checked());
                         let stages = usize::try_from(count.value()).unwrap_or(1);
                         for (index, row) in rows.iter().enumerate() {
                             let shown = index < stages;
@@ -396,12 +406,12 @@ impl App {
                             row.active.enable(on);
                             row.slider.show(shown);
                             row.slider.enable(on);
-                            if let Some((label, _)) = row.y {
-                                label.show(shown);
-                            }
-                            for spin in std::iter::once(row.x).chain(row.y.map(|(_, y)| y)) {
-                                spin.show(shown);
-                                spin.enable(on);
+                            row.x.show(shown);
+                            row.x.enable(on);
+                            if let Some((label, y)) = row.y {
+                                label.show(shown && split);
+                                y.show(shown && split);
+                                y.enable(on);
                             }
                         }
                     }
@@ -475,8 +485,18 @@ impl App {
                         }
                     }
                 }
-                (Control::Dpi { count, rows }, Value::Dpi(dpi)) => {
+                (
+                    Control::Dpi {
+                        count,
+                        separate,
+                        rows,
+                    },
+                    Value::Dpi(dpi),
+                ) => {
                     count.set_value(dpi.count as i32);
+                    if let Some(separate) = separate {
+                        separate.set_value(dpi.stages.iter().take(dpi.count).any(|(x, y)| x != y));
+                    }
                     if let Some(row) = rows.get(dpi.active) {
                         row.active.set_value(true);
                     }
@@ -534,7 +554,11 @@ impl App {
                         })
                         .unwrap_or_else(|| i64::from(spin.value())),
                 ),
-                Control::Dpi { count, rows } => {
+                Control::Dpi {
+                    count,
+                    separate,
+                    rows,
+                } => {
                     let Value::Dpi(old) = old else {
                         return Err("Stale DPI settings.".into());
                     };
@@ -554,7 +578,8 @@ impl App {
                         .map(|(i, (row, kept))| {
                             if i < count {
                                 let x = value(row.x);
-                                (x, row.y.map_or(x, |(_, y)| value(y)))
+                                let split = separate.is_some_and(|c| c.is_checked());
+                                (x, row.y.filter(|_| split).map_or(x, |(_, y)| value(y)))
                             } else {
                                 *kept
                             }
@@ -727,6 +752,15 @@ fn build_form(app: &Rc<App>, def: Arc<Def>) -> Form {
                     .with_range(1, slots as i32)
                     .build();
                 put(&r, &count);
+                let separate = field.xy.then(|| {
+                    let separate = CheckBox::builder(&panel)
+                        .with_label("Separate X and Y")
+                        .build();
+                    put(&r, &separate);
+                    let app = app.clone();
+                    separate.on_toggled(move |_| app.sync());
+                    separate
+                });
                 let rows: Vec<DpiRow> = (0..slots)
                     .map(|index| {
                         let r = BoxSizer::builder(Orientation::Horizontal).build();
@@ -795,7 +829,11 @@ fn build_form(app: &Rc<App>, def: Arc<Def>) -> Form {
                     }
                     app.sync();
                 });
-                Control::Dpi { count, rows }
+                Control::Dpi {
+                    count,
+                    separate,
+                    rows,
+                }
             }
             Kind::Buttons => {
                 let profiles = def.profiles.as_ref().map_or(0, |p| p.count);
