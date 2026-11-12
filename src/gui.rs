@@ -131,12 +131,7 @@ fn worker(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
                         if let Ok(snapshot) = &result {
                             session = Some((device, snapshot.clone()));
                         }
-                        done(
-                            def,
-                            result,
-                            "Settings read. Changes are saved only when you select Apply.",
-                            true,
-                        )
+                        done(def, result, "", true)
                     }
                     Err(error) => done(None, Err(error), "", true),
                 }
@@ -690,7 +685,7 @@ fn build_form(app: &Rc<App>, def: Arc<Def>) -> Form {
                 let (min, max) = (field.min.unwrap_or(0) as i32, field.max.unwrap_or(0) as i32);
                 let spin = SpinCtrl::builder(&panel).with_range(min, max).build();
                 let mode = (!field.options.is_empty()).then(|| {
-                    let mut labels = vec!["Value".to_string()];
+                    let mut labels = vec!["Off".to_string()];
                     labels.extend(field.options.iter().map(|o| o.label.clone()));
                     let mode = Choice::builder(&panel).with_choices(labels).build();
                     put(&r, &mode);

@@ -152,7 +152,7 @@ engine reads the first location and writes all of them (for mirrored bytes).
 |---|---|
 | `toggle` | `at`. Stored as 0 or 1. |
 | `choice` | `at`, `options = [{ label, value, send? }]`, `limit` (offer only the first N options) |
-| `range` | `at`, `min`, `max`, `unit`, `slider`, optional `options` (named special values outside `min`..`max`, shown as a mode list) |
+| `range` | `at`, `min`, `max`, `unit`, `slider`, optional `options` (named special values outside `min`..`max`, shown as a mode list whose first entry, Off, uses the number) |
 | `dpi` | `stages` (slots), `min`, `max`, `step`, `count`, `active`, `x`, optional `y`, `xy` (separate X/Y editing) |
 | `buttons` | `names`, `at` (with `stride`), optional `extra` (second region per button), `actions`, `left_click` |
 
