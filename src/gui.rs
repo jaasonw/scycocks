@@ -32,7 +32,7 @@ enum Event {
     Done {
         /// The resolved definition whenever a device opened, even if reading it failed.
         def: Option<Arc<Def>>,
-        result: Result<Snapshot, String>,
+        result: Result<Arc<Snapshot>, String>,
         message: String,
         connection_attempt: bool,
     },
@@ -68,26 +68,40 @@ fn worker(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
         )));
     }
     let mut selected = None;
-    let mut session: Option<(Device, Snapshot)> = None;
+    let mut session: Option<(Device, Arc<Snapshot>)> = None;
     let mut pairing: Option<(Device, Instant)> = None;
     let done = |def: Option<Arc<Def>>, result, message: &str, connection_attempt| {
-        events
+        let sent = events
             .send(Event::Done {
                 def,
                 result,
                 message: message.into(),
                 connection_attempt,
             })
-            .is_ok()
+            .is_ok();
+        if sent {
+            wxdragon::app::wake_up_idle();
+        }
+        sent
     };
     loop {
-        let command = match commands.recv_timeout(Duration::from_secs(1)) {
+        let poll = pairing.is_some()
+            || session
+                .as_ref()
+                .is_some_and(|(device, _)| device.def().online.is_some());
+        let command = match if poll {
+            commands.recv_timeout(Duration::from_secs(1))
+        } else {
+            commands
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        } {
             Ok(command) => command,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if let Some((device, deadline)) = &pairing {
                     let result = match device.poll_pair() {
-                        Ok(true) => device.snapshot().map(Some),
+                        Ok(true) => device.snapshot().map(Arc::new).map(Some),
                         Ok(false) if Instant::now() < *deadline => Ok(None),
                         Ok(false) => Err(
                             "Pairing timed out. Repeat the mouse pairing gesture and try again."
@@ -127,7 +141,7 @@ fn worker(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
                 match open(&entries, &mut selected, &events) {
                     Ok(device) => {
                         let def = Some(device.def().clone());
-                        let result = device.snapshot();
+                        let result = device.snapshot().map(Arc::new);
                         if let Ok(snapshot) = &result {
                             session = Some((device, snapshot.clone()));
                         }
@@ -164,15 +178,15 @@ fn worker(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
                         "No settings changed. Nothing was written.",
                     ),
                     Command::Apply(values) => (
-                        device.apply(snapshot, &values),
+                        device.apply(snapshot, &values).map(Arc::new),
                         "Saved and verified the changed settings.",
                     ),
                     Command::Profile(p) => (
-                        device.set_profile(p),
+                        device.set_profile(p).map(Arc::new),
                         "Profile loaded. Pending edits were discarded.",
                     ),
                     _ => (
-                        device.factory_reset(),
+                        device.factory_reset().map(Arc::new),
                         "Factory settings restored and read from the mouse.",
                     ),
                 };
@@ -261,7 +275,7 @@ struct State {
     reset_armed: Cell<bool>,
     details: RefCell<String>,
     connection_status: RefCell<String>,
-    snapshot: RefCell<Option<Snapshot>>,
+    snapshot: RefCell<Option<Arc<Snapshot>>>,
     devices: RefCell<Vec<CString>>,
     form: RefCell<Option<Form>>,
 }
@@ -1102,11 +1116,12 @@ fn build(commands: mpsc::Sender<Command>, events: mpsc::Receiver<Event>) {
         });
     }
 
-    let timer = Timer::new(&frame);
+    let timer = Rc::new(Timer::new(&frame));
     {
         let app = app.clone();
-        let mut next_connect = None;
-        timer.on_tick(move |_| {
+        let timer = timer.clone();
+        frame.on_idle(move |event| {
+            event.skip(true);
             let mut changed = false;
             while let Ok(event) = events.try_recv() {
                 changed = true;
@@ -1143,7 +1158,7 @@ fn build(commands: mpsc::Sender<Command>, events: mpsc::Receiver<Event>) {
                         }
                         match result {
                             Ok(snapshot) => {
-                                next_connect = None;
+                                timer.stop();
                                 app.state.connected.set(true);
                                 app.state.reset_armed.set(false);
                                 *app.state.details.borrow_mut() =
@@ -1161,7 +1176,11 @@ fn build(commands: mpsc::Sender<Command>, events: mpsc::Receiver<Event>) {
                                         .into()
                                 };
                                 app.set_status(&error);
-                                next_connect = connection_attempt.then(|| Instant::now() + RETRY);
+                                if connection_attempt {
+                                    timer.start(RETRY.as_millis() as i32, true);
+                                } else {
+                                    timer.stop();
+                                }
                                 *app.state.snapshot.borrow_mut() = None;
                             }
                         }
@@ -1171,16 +1190,16 @@ fn build(commands: mpsc::Sender<Command>, events: mpsc::Receiver<Event>) {
             if changed {
                 app.sync();
             }
-            if !app.state.connected.get()
-                && !app.state.busy.get()
-                && next_connect.is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                next_connect = None;
+        });
+    }
+    {
+        let app = app.clone();
+        timer.on_tick(move |_| {
+            if !app.state.connected.get() && !app.state.busy.get() {
                 app.send(Command::Connect(None), "Reading mouse settings…");
             }
         });
     }
-    timer.start(100, false);
     frame.on_close(move |event| {
         timer.stop();
         event.skip(true);

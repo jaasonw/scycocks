@@ -102,6 +102,37 @@ fn shipped_files_and_every_variant_parse() {
 }
 
 #[test]
+fn catalog_keeps_discovery_rules_without_full_definitions() {
+    for (name, text) in BUILTIN {
+        let def = parse(text).unwrap();
+        let entry = Entry::new((*name).into(), Cow::Borrowed(text)).unwrap();
+        assert_eq!(entry.source, *name);
+        assert_eq!(entry.name, def.name);
+        for rule in &def.matches {
+            let facts = rule
+                .iter()
+                .map(|(name, values)| (name.clone(), values.as_slice()[0].clone()))
+                .collect();
+            assert!(entry.matches.iter().any(|rule| def::matches(rule, &facts)));
+        }
+        assert!(matches!(entry.text, Cow::Borrowed(_)));
+        assert_eq!(entry.text, *text);
+    }
+}
+
+#[test]
+fn catalog_still_rejects_invalid_definitions() {
+    let text = BUILTIN[0].1;
+    for broken in [
+        text.replace("scyrox", "unknown_family"),
+        text.replace("kind = \"dpi\"", "kind = \"invalid\""),
+        format!("{text}\n[[variant]]\nwhen.pid = 1\nsize = \"invalid\"\n"),
+    ] {
+        assert!(Entry::new("invalid.toml".into(), Cow::Owned(broken)).is_err());
+    }
+}
+
+#[test]
 fn scyrox_unchanged_settings_do_not_write() {
     let (device, old) = scyrox(5);
     assert!(frames(&device, &old, &old.values).unwrap().is_empty());

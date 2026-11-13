@@ -32,7 +32,20 @@ const BUILTIN: &[(&str, &str)] = &[
 pub struct Entry {
     pub source: String,
     pub text: Cow<'static, str>,
-    pub def: Def,
+    name: String,
+    matches: Vec<def::When>,
+}
+
+impl Entry {
+    fn new(source: String, text: Cow<'static, str>) -> Result<Self, String> {
+        let def = parse(&text)?;
+        Ok(Self {
+            source,
+            text,
+            name: def.name,
+            matches: def.matches,
+        })
+    }
 }
 
 /// Folder for extra device files; a file named like a built-in one replaces it.
@@ -77,8 +90,8 @@ pub fn load() -> (Vec<Entry>, Vec<String>) {
     }
     let mut entries = Vec::new();
     for (source, text) in files {
-        match parse(&text) {
-            Ok(def) => entries.push(Entry { source, text, def }),
+        match Entry::new(source.clone(), text) {
+            Ok(entry) => entries.push(entry),
             Err(error) => problems.push(format!("{source}: {error}")),
         }
     }
@@ -162,14 +175,14 @@ pub fn discover(entries: &[Entry]) -> Result<Vec<Candidate>, String> {
             let facts = hid_facts(info);
             let entry = entries
                 .iter()
-                .position(|e| e.def.matches.iter().any(|m| def::matches(m, &facts)))?;
+                .position(|e| e.matches.iter().any(|m| def::matches(m, &facts)))?;
             Some(Candidate {
                 entry,
                 path: info.path().to_owned(),
                 label: format!(
                     "{} [{:04X}:{:04X}]",
                     info.product_string()
-                        .map_or_else(|| entries[entry].def.name.clone(), |p| p.trim().into()),
+                        .map_or_else(|| entries[entry].name.clone(), |p| p.trim().into()),
                     info.vendor_id(),
                     info.product_id()
                 ),
@@ -245,20 +258,21 @@ struct Frame {
 impl Device {
     pub fn open(entries: &[Entry], candidate: &Candidate) -> Result<Self, String> {
         let entry = &entries[candidate.entry];
-        let family = family::find(&entry.def.family)
-            .ok_or_else(|| format!("Unknown family `{}`.", entry.def.family))?;
+        let def = Def::parse(&entry.text)?;
+        let family =
+            family::find(&def.family).ok_or_else(|| format!("Unknown family `{}`.", def.family))?;
         let api = hidapi::HidApi::new().map_err(|e| e.to_string())?;
         let info = api
             .device_list()
             .find(|d| d.path() == candidate.path.as_c_str())
             .ok_or("The selected device disconnected.")?;
         let mut device = Self {
-            def: Arc::new(entry.def.clone()),
+            def: Arc::new(def),
             family,
             link: (family.open)(&api, info)?,
         };
         let mut facts = candidate.facts.clone();
-        for identify in &entry.def.identify {
+        for identify in &device.def.identify {
             let reply = device.send(&identify.frame, &Ctx::default(), true)?;
             for (name, offset) in &identify.facts {
                 let byte = reply
@@ -267,7 +281,7 @@ impl Device {
                 facts.insert(name.clone(), Fact::Int(i64::from(*byte)));
             }
         }
-        for require in &entry.def.require {
+        for require in &device.def.require {
             if !def::matches(&require.when, &facts) {
                 return Err(require.error.clone());
             }
