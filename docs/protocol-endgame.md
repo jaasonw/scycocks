@@ -61,9 +61,9 @@ everything after `0x72` are always written as 0. Offsets are blob offsets.
 | `0x6F` | Sensor Glass Mode | 0/1 (control hidden by the tool) |
 | `0x70` | Sensor angle tuning | signed byte, slider −127..127 |
 | `0x71` | Force max sensor fps | 0/1 |
-| `0x72` | Multiclick acknowledgement | 1 after "I understand…" is checked; unlocks the filter controls |
+| `0x72` | Multiclick acknowledgement | 1 after "I understand…" is checked; unlocks the tool's filter controls. This app copies it back unchanged |
 
-Unmapped bytes inside `0x00..0x72` (`0x00`, `0x07`, `0x0F..0x22`, button 5) are copied back
+Unmapped bytes inside `0x00..=0x72` (`0x00`, `0x07`, `0x0F..0x22`, button 5, `0x72`) are copied back
 unchanged.
 
 Buttons `n`: 0 left, 1 right, 2 middle, 3 forward, 4 back, 5 unused by the tool, 6 wheel up,

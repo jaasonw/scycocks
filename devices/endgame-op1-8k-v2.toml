@@ -149,19 +149,10 @@ page = "Buttons"
 at = { offset = 0x06, mask = 0x01 }
 
 [[field]]
-id = "multiclick_ack"
-kind = "toggle"
-label = "Unlock multiclick filters"
-page = "Buttons"
-help = "The multiclick filter is not a traditional debounce slider; lower values do not affect click latency."
-at = { offset = 0x72 }
-
-[[field]]
 id = "left_filter"
 kind = "range"
 label = "Left multiclick filter"
 page = "Buttons"
-requires = "multiclick_ack"
 unit = "ms"
 slider = true
 min = 0
@@ -175,7 +166,6 @@ kind = "range"
 label = "Right multiclick filter"
 page = "Buttons"
 help = "GX Speed and GX Safe Mode set the SPDT switch mode and replace the filter."
-requires = "multiclick_ack"
 unit = "ms"
 slider = true
 min = 0
@@ -188,7 +178,6 @@ id = "middle_filter"
 kind = "range"
 label = "Middle multiclick filter"
 page = "Buttons"
-requires = "multiclick_ack"
 unit = "ms"
 slider = true
 min = 0
@@ -200,7 +189,6 @@ id = "forward_filter"
 kind = "range"
 label = "Forward multiclick filter"
 page = "Buttons"
-requires = "multiclick_ack"
 unit = "ms"
 slider = true
 min = 0
@@ -212,7 +200,7 @@ id = "back_filter"
 kind = "range"
 label = "Back multiclick filter"
 page = "Buttons"
-requires = "multiclick_ack"
+help = "The multiclick filter is not a traditional debounce slider; lower values do not affect click latency."
 unit = "ms"
 slider = true
 min = 0
@@ -244,7 +232,7 @@ actions = ["left", "right", "middle", "back", "forward", "wheel_up", "wheel_down
 id = "settings"
 fields = [
     "dpi", "rate", "lod", "angle_snap", "led_liftoff", "motion_sync", "max_fps", "ripple", "downshift",
-    "angle", "slamclick", "multiclick_ack", "left_filter", "right_filter", "middle_filter",
+    "angle", "slamclick", "left_filter", "right_filter", "middle_filter",
     "forward_filter", "back_filter", "buttons", "wheel",
 ]
 frame = [0xA0, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "buffer"]
